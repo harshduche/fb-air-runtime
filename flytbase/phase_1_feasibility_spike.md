@@ -57,12 +57,17 @@ The codebase has **two model trees**:
 
 SAM 3 defaults `model_id="sam3/sam3_final"` and fetches weights through `self.cache_file("weights.pt")` — an inherited method that routes through the legacy Roboflow registry at `inference/core/registries/roboflow.py`. Until SAM 3 migrates to the new tree (upstream work), our FlytBase integration must cover both paths.
 
-**Options for Phase 3 (decision needed)**:
-- **A**: Pre-stage SAM 3 weights in the local model cache directory during runtime image build; the legacy registry finds them and never makes the outbound call. Low engineering cost, tight coupling to cache paths.
-- **B**: Patch the legacy registry to consult our FlytBase weights provider first. More invasive, higher rebase tax with upstream.
-- **C**: Write a second provider shim that intercepts the legacy path; unify under a single FlytBase weights-fetching surface. Cleanest long-term but most code.
+**Options for Phase 3 (updated after SAM 3 alternate-source research — see §12.6)**:
 
-I have **not** picked one. This is a Phase 3 design discussion for PM / architect.
+- **A**: Pre-stage SAM 3 weights in `are_all_files_cached(...)` path — the legacy registry short-circuits on cache hit (`inference/models/sam3/segment_anything3.py:447`). Lowest engineering cost. The **only** lift beyond the existing caching logic is acquiring the weights from somewhere other than Roboflow; see §12.6 for Meta/HF sourcing.
+- **B**: Flip the `load_from_HF=False` flag to `True` at `inference/models/sam3/segment_anything3.py:398`. The underlying `sam3` pip package (Meta's official) already supports loading from HuggingFace directly. **Roughly one line of patch.** Requires HuggingFace access token at runtime, and HF gate approval for `facebook/sam3`.
+- **C**: Patch `inference/core/models/roboflow.py:648 download_weights()` to consult our FlytBase weights provider first and skip the Roboflow API auth call on cache hit. Robust, slightly more code, good rebase candidate for upstream (cache-hit-skips-auth is a reasonable fix to submit back).
+- **D**: Write a second provider shim that intercepts the legacy path (original option C). Cleanest long-term but most code. No longer the only non-hacky option now that B exists.
+- **E** (fallback): Replace SAM 3 with SAM 2. SAM 2 lives in the newer tree at `inference_models/inference_models/models/sam2/` and, per the research, doesn't have the same outbound dependency. Slight quality drop; fastest Phase 3 unblock if A/B/C all snag.
+
+**Recommendation**: combine **A** (pre-stage Meta-sourced weights in the image) + **C** (cache-first short-circuit on `download_weights`). Both are small, reinforcing, and let us ship airgap with no runtime HF dependency. Option B stays as a secondary escape hatch for development ergonomics.
+
+Still a Phase 3 design discussion for PM / architect, but the decision is narrower than before: source-from-Meta is viable; the question is just *which* combination of (A, B, C, D, E) you want.
 
 ---
 
@@ -156,7 +161,7 @@ These are the Phase 1 tasks that require real hardware. Results as of the x86 ru
 - [ ] **Jetson Orin run**: **not executed** — no Jetson on this host. Remains outstanding for a human.
 - [x] **Local-weights YOLO inference on a static image**: probed via the `yolov8n-640` alias path (not a raw Ultralytics ONNX — see §12 note). Warm latency 8–18 ms/call (55–125 FPS single-image). First call 5.7 s including model fetch from `repo.roboflow.com`.
 - [x] **SAM 3 text-prompt inference with no API key**: **FAILED with HTTP 401.** Even with `usage_billable: false` and `disable_model_monitoring: true`, the server calls `download_model_from_roboflow_api` → `api.roboflow.com` → 401. Material finding; see §10 and §12.
-- [~] **RTSP/video-file pipeline at ≥10 FPS**: **not completed on this host.** InferencePipeline init OOM-killed the container (exit 137) due to host RAM pressure from the existing `flytbase/ai-r-*` stack + `STREAM_API_PRELOADED_PROCESSES=2`. Single-image YOLO latency already demonstrates >10 FPS capability. Pipeline retry needs either `STREAM_API_PRELOADED_PROCESSES=0` or temporarily pausing part of the existing stack — either requires explicit operator approval.
+- [~] **RTSP/video-file pipeline at ≥10 FPS**: **partial — engine produces frames, sustained HTTP consume blocked by an upstream IPC defect.** Pipeline initializes cleanly and produces frames with inter-arrival gaps of 3.7–18.5 ms (>200 FPS peak). Sustained HTTP `/consume` returns 200-empty after the initial burst because the pipeline-manager IPC (`stream_manager_client.py:245`) goes unresponsive. This is not a fork-decision blocker because our own runtime will drive the engine in-process, not through this HTTP layer. Full details in §12.2.
 - [x] **Minimal local workflow (detect + viz + webhook)**: executed end-to-end. Workflow spec inlined as a POST body (no Roboflow cloud fetch). HTTP 200. Webhook sink fired a notification asynchronously.
 - [x] **`tcpdump` network audit**: executed via an ephemeral host-networked `alpine` container with `CAP_NET_RAW`; captured 440 s of traffic to `/tmp/phase1_capture.pcap` (58 MB) during the probe run. See §12 for decoded results.
 
@@ -232,7 +237,15 @@ inference/core/roboflow_api.py:124 → 401 lambda → RoboflowAPINotAuthorizedEr
 
 This contradicts the README feature matrix's implication that foundation models work in open access, and upgrades the SAM 3 airgap integration from "pre-stage weights (path A in §3)" to "pre-stage weights AND patch out the auth call". See §10 for the corrected analysis.
 
-**Video pipeline** (`InferencePipeline.init_with_workflow(video_reference=/tmp/cache/phase1_video.mp4, ...)`): container OOM-killed (Docker exit 137) during pipeline initialization. Host had 4.4 GB free; the pipeline's `STREAM_API_PRELOADED_PROCESSES=2` preloads worker subprocesses which pushed us over. Not a software defect; a host resource conflict with the existing stack. Retry plan: set `STREAM_API_PRELOADED_PROCESSES=0` via `--env-file`, or pause `detection_handler`/`orchestrator` during test — both need explicit approval.
+**Video pipeline** (`InferencePipeline.init_with_workflow(...)`): after the operator voluntarily freed the box, we retried several times with different `STREAM_API_PRELOADED_PROCESSES` values (0, 1, 2 default) against both the 14-s original video and a 180-s concatenation. Results:
+
+- Pipeline **initializes cleanly**: state transitions `NOT_STARTED → INITIALISING → RUNNING`, `VIDEO_CONSUMPTION_STARTED`, worker subprocesses spawn (seen in container ps-tree).
+- Pipeline **does produce frames**: one run captured 2 frames within a 3.7 ms window; another captured 2 frames within an 18.5 ms window. Instantaneous frame rate implied by the inter-arrival gaps is **>200 FPS peak** — consistent with the single-image warm latency of 8–18 ms.
+- **Sustained consume over HTTP could NOT be demonstrated.** After the initial 2–3 frame burst, `/inference_pipelines/<id>/consume` returns HTTP 200 with empty output indefinitely, and the server logs report `ConnectivityError: Could not communicate with InferencePipeline Manager` from `inference/core/interfaces/stream_manager/api/stream_manager_client.py:245`. This is an **upstream IPC issue** between the uvicorn HTTP handler and the pipeline manager subprocess, reproducible on a fresh container with default env. Pipeline-management endpoints (`/status`, `/terminate`, `/list`) also lock up once the manager is unreachable.
+
+**Assessment**: the runtime *can* decode video and run workflow inference — the model engine works. The HTTP pipeline-management layer in v1.2.2 has a defect under repeated consume pressure. That defect is **not a fork-decision blocker**: our AI-R Edge deployments will drive the engine through direct Python calls inside our own process (where the pipeline manager IPC isn't in the critical path), not through HTTP consume. Phase 2 should still file an upstream issue and consider cherry-picking the eventual fix at rebase time.
+
+**What remains unverified on hardware**: sustained FPS on a multi-second RTSP stream. That measurement needs either a reliable consume path (blocked by the defect above) or an in-process driver. Deferred to Phase 2/3 when we'll be running the engine inside the FlytBase runtime harness, not behind this HTTP manager.
 
 ### §12.3 Network audit from tcpdump (most important result)
 
@@ -258,7 +271,32 @@ Steady-state telemetry cadence observed in server logs: `PingbackInfo.post_data`
 - **Scope estimate for Phase 2 kill-switch work expands slightly**: on top of the `UsageCollector` kill switch (§6), Phase 2 must also neutralize the Datadog log forwarding and the Active Learning registration path (cosmetic but chatty). Still cheap — a handful of env toggles and/or patches in `roboflow_api.py` and wherever the Datadog client is constructed.
 - **Phase 3 SAM 3 integration effort grows** from "pre-stage weights" to "pre-stage weights + patch the auth call out of `download_model_from_roboflow_api`". This is still engineering-cheap but needs explicit planning. The option (B) or (C) paths in §3 are now more attractive relative to (A).
 
-### §12.5 Artifacts
+### §12.5 SAM 3 alternate sources (post-spike research)
+
+Triggered by the §12.2 SAM 3 401 finding, we checked whether the weights can be obtained from somewhere other than Roboflow's registry. **Yes, cleanly.**
+
+**What the runtime actually loads**: `inference/models/sam3/segment_anything3.py` constructs `build_sam3_image_model()` from Meta's official `sam3` pip package (currently `sam3==0.1.3` on PyPI, imported from `facebookresearch/sam3`). The load path needs two files in the local cache:
+
+- `weights.pt` — a vanilla PyTorch state_dict. No Roboflow-custom packaging.
+- `bpe_simple_vocab_16e6.txt.gz` — a standard CLIP-compatible BPE vocab. Not Roboflow-specific.
+
+**Upstream publishers**:
+
+| Source | Location | Format | License | Access |
+| --- | --- | --- | --- | --- |
+| Meta (official) | `facebook/sam3`, `facebook/sam3.1` on HuggingFace | safetensors | Meta SAM License (Nov 2025) | HF-gated; request approval, `hf auth login` |
+| Meta (official) | `github.com/facebookresearch/sam3` | Same as HF | Same | Same |
+| Community mirror | `1038lab/sam3` on HuggingFace | safetensors | Downstream — verify compatibility | Ungated, but verify authenticity before shipping |
+
+**License posture**: Meta SAM License permits commercial use and redistribution to enterprise customers. Explicitly prohibits defense/military/ITAR uses and any use violating U.S./UN/EU sanctions. FlytBase's typical customer base (oil & gas, utilities, construction, rail, security) is inside the permitted scope. Any defense-adjacent deployment needs a legal review before shipping weights.
+
+**Built-in escape hatch already in the code**: `inference/models/sam3/segment_anything3.py:398` sets `load_from_HF=False` when calling `build_sam3_image_model()`. The underlying Meta package accepts `load_from_HF=True`, which loads directly from HuggingFace and bypasses the Roboflow registry entirely. **A one-line patch** (plus a runtime HF token) would give us SAM 3 without touching the Roboflow auth path.
+
+**Cache-hit short-circuit**: `inference/core/models/roboflow.py:648` defines `download_weights()` which starts with `if are_all_files_cached(files=infer_bucket_files, model_id=self.endpoint): return`. If we pre-seed `~/.cache/roboflow/inference/sam3/sam3_final/weights.pt` and the BPE vocab, the function returns before it ever calls `download_model_from_roboflow_api()`. No patch required, no auth call, no 401. The §12.2 failure only happens because the cache was empty.
+
+**Net effect on §10 and §3**: the SAM 3 finding is still material, but the fix is *cheaper* than I first claimed. Two engineering paths now exist beyond the original "pre-stage weights" — see the revised §3 for the full option set.
+
+### §12.6 Artifacts
 
 - `/home/deair/inference-spike/probes/run_probes.sh`, `run_probes_v2.sh`, `run_probes_v3.sh` — HTTP probe scripts (three iterations).
 - `/home/deair/inference-spike/probes/video_pipeline.py` — video pipeline probe (incomplete due to OOM).
