@@ -217,6 +217,40 @@ runtime checks against.
 
 ---
 
+## D11 — Flow builder strategy
+
+**Decision**: build a FlytBase-owned workflow builder (`/flybuild`) as
+a React SPA served in-container. Keep Roboflow's `/build` iframe
+available during A/B; retire it when `/flybuild` reaches parity.
+
+**Why it matters**: Phase 1 found that upstream `/build` is a 92-line
+shell that iframes `https://app.roboflow.com/workflows/local`. That
+violates the airgap rule in [01_scope_and_constraints.md](01_scope_and_constraints.md)
+§4 (no runtime calls to Roboflow servers), hands Roboflow product
+control over our authoring UX, and has no path to working in On-Prem
+environments with no outbound internet. Three alternatives were on the
+table:
+
+- **A (chosen)**: build a minimal FlytBase builder on top of the
+  already-Apache-2.0 workflow engine APIs.
+- **B**: snapshot and self-host Roboflow's builder SPA. Rejected —
+  their cloud SPA is almost certainly not Apache 2.0 (only the
+  inference server is), and we'd pay ongoing licensing + rebase cost
+  on a UI we don't control.
+- **C**: skip a visual builder entirely; author workflows as JSON.
+  Rejected for operator-facing product reasons — customers deploying
+  templates won't hand-edit JSON. Still supported as the API surface.
+
+**Stance**: settled. Plan in [06_flow_builder_plan.md](06_flow_builder_plan.md);
+MVP implementation begins under `inference/core/interfaces/http/flyt_builder/`
+behind `ENABLE_FLYT_BUILDER=False` default.
+
+**Sign-off needed**: architect (confirms React stack and single-hunk
+upstream-rebase seam at `http_api.py`), PM (confirms MVP scope is
+enough to demo airgap authoring).
+
+---
+
 ## How to update this document
 
 When a new one-way door appears:
