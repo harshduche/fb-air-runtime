@@ -442,6 +442,11 @@ MODEL_ID = os.getenv("MODEL_ID")
 ENABLE_BUILDER = str2bool(os.getenv("ENABLE_BUILDER", False))
 BUILDER_ORIGIN = os.getenv("BUILDER_ORIGIN", "https://app.roboflow.com")
 
+# Enable the FlytBase flow builder at /flybuild, default is False.
+# See flytbase/docs/06_flow_builder_plan.md. Opt-in while the MVP is
+# under development; flip default once it reaches parity with /build.
+ENABLE_FLYT_BUILDER = str2bool(os.getenv("ENABLE_FLYT_BUILDER", False))
+
 # Enable jupyter notebook server route, default is False
 NOTEBOOK_ENABLED = str2bool(os.getenv("NOTEBOOK_ENABLED", False))
 

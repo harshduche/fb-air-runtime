@@ -3550,6 +3550,29 @@ class HttpInterface(BaseInterface):
             # Attach all routes from builder to the /build prefix
             app.include_router(builder_router, prefix="/build", tags=["builder"])
 
+        # FlytBase flow builder — local SPA, airgap-friendly replacement
+        # for the Roboflow /build iframe. Independent of ENABLE_BUILDER
+        # so both can coexist during A/B (see D11 in flytbase/docs/05).
+        from inference.core.env import ENABLE_FLYT_BUILDER
+
+        if ENABLE_FLYT_BUILDER:
+            from inference.core.interfaces.http.flyt_builder.routes import (
+                router as flyt_builder_router,
+            )
+
+            app.add_middleware(
+                PathAwareCORSMiddleware,
+                match_paths=r"^/(flybuild/api|workflows/).*",
+                allow_origins=["*"],
+                allow_methods=["*"],
+                allow_headers=["*"],
+                allow_credentials=True,
+                allow_private_network=True,
+            )
+            app.include_router(
+                flyt_builder_router, prefix="/flybuild", tags=["flyt-builder"]
+            )
+
         if LEGACY_ROUTE_ENABLED:
             # Legacy object detection inference path for backwards compatibility
             @app.get(

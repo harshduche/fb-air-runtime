@@ -42,6 +42,12 @@ theme/assets/styles.css
 docs/static/
 inference_models/site/
 
+# FlytBase flow builder — keep proprietary brand assets + TS build
+# caches out of git. Brand assets are mirrored from an internal
+# repo; rebuild the frontend with `npm run build` in flyt_builder/frontend.
+fb-brand-kit/
+*.tsbuildinfo
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.

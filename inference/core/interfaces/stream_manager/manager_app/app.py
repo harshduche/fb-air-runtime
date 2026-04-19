@@ -8,6 +8,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from functools import partial
 from multiprocessing import Process, Queue
+from queue import Empty as QueueEmpty
 from socketserver import BaseRequestHandler, BaseServer
 from threading import Lock, Thread
 from types import FrameType
@@ -80,6 +81,28 @@ SOCKET_BUFFER_SIZE = 16384
 HOST = os.getenv("STREAM_MANAGER_HOST", "127.0.0.1")
 PORT = int(os.getenv("STREAM_MANAGER_PORT", "7070"))
 SOCKET_TIMEOUT = float(os.getenv("STREAM_MANAGER_SOCKET_TIMEOUT", "5.0"))
+
+# Total wall-clock time a handler is willing to wait for the pipeline
+# child process to deliver a response before giving up. Long enough to
+# tolerate heavy inference (SAM3 on CPU routinely takes 3-8s/frame plus
+# model load on first run), short enough that a dead or hung child is
+# detected in bounded time. Tune via env if a specific model needs
+# longer warmups.
+RESPONSE_WAIT_TIMEOUT = float(
+    os.getenv("STREAM_MANAGER_RESPONSE_TIMEOUT", "180.0")
+)
+# Polling cadence for the liveness check inside the wait loop.
+RESPONSE_POLL_INTERVAL = float(
+    os.getenv("STREAM_MANAGER_RESPONSE_POLL_INTERVAL", "2.0")
+)
+
+
+class PipelineResponseTimeoutError(Exception):
+    """Pipeline child failed to deliver a response within the deadline."""
+
+
+class PipelineDiedError(Exception):
+    """Pipeline child process exited before delivering a response."""
 
 
 class InferencePipelinesManagerHandler(BaseRequestHandler):
@@ -189,10 +212,17 @@ class InferencePipelinesManagerHandler(BaseRequestHandler):
             processes_table=self._processes_table,
         )
         managed_pipeline.command_queue.put((request_id, command))
-        response = get_response_ignoring_thrash(
-            responses_queue=managed_pipeline.responses_queue,
-            matching_request_id=request_id,
-        )
+        try:
+            response = get_response_ignoring_thrash(
+                responses_queue=managed_pipeline.responses_queue,
+                matching_request_id=request_id,
+                pipeline_manager=managed_pipeline.pipeline_manager,
+            )
+        except (PipelineResponseTimeoutError, PipelineDiedError) as e:
+            response = _error_response_for_stalled_pipeline(
+                exception=e, processes_table=self._processes_table,
+                pipeline_id=managed_pipeline.pipeline_id,
+            )
         serialised_response = prepare_response(
             request_id=request_id,
             response=response,
@@ -211,10 +241,17 @@ class InferencePipelinesManagerHandler(BaseRequestHandler):
             processes_table=self._processes_table,
         )
         managed_pipeline.command_queue.put((request_id, command))
-        response = get_response_ignoring_thrash(
-            responses_queue=managed_pipeline.responses_queue,
-            matching_request_id=request_id,
-        )
+        try:
+            response = get_response_ignoring_thrash(
+                responses_queue=managed_pipeline.responses_queue,
+                matching_request_id=request_id,
+                pipeline_manager=managed_pipeline.pipeline_manager,
+            )
+        except (PipelineResponseTimeoutError, PipelineDiedError) as e:
+            response = _error_response_for_stalled_pipeline(
+                exception=e, processes_table=self._processes_table,
+                pipeline_id=managed_pipeline.pipeline_id,
+            )
         serialised_response = prepare_response(
             request_id=request_id,
             response=response,
@@ -287,21 +324,113 @@ def handle_command(
     managed_pipeline = processes_table[pipeline_id]
     with managed_pipeline.operation_lock:
         managed_pipeline.command_queue.put((request_id, command))
-        return get_response_ignoring_thrash(
-            responses_queue=managed_pipeline.responses_queue,
-            matching_request_id=request_id,
+        try:
+            return get_response_ignoring_thrash(
+                responses_queue=managed_pipeline.responses_queue,
+                matching_request_id=request_id,
+                pipeline_manager=managed_pipeline.pipeline_manager,
+            )
+        except (PipelineResponseTimeoutError, PipelineDiedError) as e:
+            return _error_response_for_stalled_pipeline(
+                exception=e,
+                processes_table=processes_table,
+                pipeline_id=pipeline_id,
+            )
+
+
+def _error_response_for_stalled_pipeline(
+    exception: Exception,
+    processes_table: Dict[str, "ManagedInferencePipeline"],
+    pipeline_id: str,
+) -> dict:
+    """Build an error response for a wedged/dead pipeline and evict the
+    child from the table if it's actually gone. Keeps the handler's
+    contract intact: returns a serialisable dict that ``prepare_response``
+    can turn into a normal TCP reply, so the client sees a clean error
+    instead of a dropped connection.
+    """
+    if isinstance(exception, PipelineDiedError):
+        with PROCESSES_TABLE_LOCK:
+            processes_table.pop(pipeline_id, None)
+    public_error_message = (
+        f"Pipeline is not responding: {exception}. "
+        "The child process has been evicted; try running again."
+        if isinstance(exception, PipelineDiedError)
+        else (
+            f"Pipeline did not respond in time: {exception}. "
+            "Consider lowering max_fps or switching to a lighter model."
         )
+    )
+    logger.error(
+        "Stalled pipeline %s — %s: %s",
+        pipeline_id,
+        type(exception).__name__,
+        exception,
+    )
+    return describe_error(
+        exception=exception,
+        error_type=ErrorType.INTERNAL_ERROR,
+        public_error_message=public_error_message,
+    )
 
 
 def get_response_ignoring_thrash(
-    responses_queue: Queue, matching_request_id: str
+    responses_queue: Queue,
+    matching_request_id: str,
+    pipeline_manager: Optional[InferencePipelineManager] = None,
+    total_timeout: float = RESPONSE_WAIT_TIMEOUT,
 ) -> dict:
+    """Wait for a response from the pipeline child with the given
+    ``request_id``, giving up after ``total_timeout`` seconds.
+
+    Prior to 2026-04 this function called ``responses_queue.get()`` with
+    no timeout. If the child process died, hung, or silently exited
+    without ever putting a response on the queue, every handler thread
+    in the parent got stuck here forever — still holding
+    ``operation_lock`` and the client's TCP socket. New client requests
+    then queued up in undrained socket receive buffers and saturated the
+    manager's accept backlog, manifesting as
+    ``ConnectivityError: Could not establish communication with
+    InferencePipeline Manager`` for every subsequent request until the
+    operator restarted the whole container. Evidence: stuck
+    ``ESTABLISHED`` sockets on :7070 with non-zero ``rx_queue`` sitting
+    against a listener whose worker threads were all in
+    ``responses_queue.get()``.
+
+    The fix: poll with a short per-attempt timeout, probe the child's
+    ``is_alive()`` between polls, and raise after ``total_timeout`` so
+    the caller can release the lock and return an actionable error to
+    the client. Non-matching responses are still logged + dropped as
+    before.
+    """
+    deadline = time.monotonic() + total_timeout
     while True:
-        response = responses_queue.get()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PipelineResponseTimeoutError(
+                f"No response from pipeline after {total_timeout:.0f}s "
+                f"(request_id={matching_request_id})."
+            )
+        try:
+            response = responses_queue.get(
+                timeout=min(RESPONSE_POLL_INTERVAL, remaining)
+            )
+        except QueueEmpty:
+            # Nothing on the queue this tick. Check that the child is
+            # still alive — otherwise we'd spin until the deadline for
+            # a response that will never come.
+            if pipeline_manager is not None and not pipeline_manager.is_alive():
+                raise PipelineDiedError(
+                    f"Pipeline child exited before responding "
+                    f"(request_id={matching_request_id}, "
+                    f"exitcode={pipeline_manager.exitcode})."
+                )
+            continue
         if response[0] == matching_request_id:
             return response[1]
         logger.warning(
-            f"Dropping response for request_id={response[0]} with payload={response[1]}"
+            f"Dropping response for request_id={response[0]} "
+            f"with payload={response[1]}"
         )
 
 
