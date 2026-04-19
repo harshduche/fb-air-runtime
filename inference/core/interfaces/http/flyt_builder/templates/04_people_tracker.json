@@ -1,0 +1,35 @@
+{
+  "name": "People Tracker",
+  "description": "Track people across frames with ByteTrack and overlay trajectories. Wire this one to a video or RTSP source to see it in action.",
+  "specification": {
+    "version": "1.0",
+    "inputs": [
+      { "type": "WorkflowImage", "name": "image" }
+    ],
+    "steps": [
+      {
+        "type": "roboflow_core/roboflow_object_detection_model@v2",
+        "name": "detector",
+        "images": "$inputs.image",
+        "model_id": "yolov8n-640",
+        "confidence": 0.3,
+        "class_filter": ["person"]
+      },
+      {
+        "type": "roboflow_core/byte_tracker@v3",
+        "name": "tracker",
+        "detections": "$steps.detector.predictions"
+      },
+      {
+        "type": "roboflow_core/trace_visualization@v1",
+        "name": "trace_viz",
+        "image": "$inputs.image",
+        "predictions": "$steps.tracker.tracked_detections"
+      }
+    ],
+    "outputs": [
+      { "type": "JsonField", "name": "tracks", "selector": "$steps.tracker.tracked_detections" },
+      { "type": "JsonField", "name": "trace_image", "selector": "$steps.trace_viz.image" }
+    ]
+  }
+}
