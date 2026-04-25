@@ -145,6 +145,19 @@ Smoke tests on the provider (no engine restart needed):
 
 ## What this PR (and the sibling) do NOT do (gated on Phase 3 wiring)
 
+**Status (2026-04-26): the LocalONNXModel gap closed via a
+cache-staging adapter — `inference/core/registries/flytbase_bundle_adapter.py`.
+`bundle://` URIs now resolve to a synthetic Roboflow-shaped endpoint
+(`flytbase-<template>/<version>`), the bundle's weights are
+symlinked into `MODEL_CACHE_DIR`, manifest-derived `environment.json`
++ `class_names.txt` + `model_type.json` are synthesised, and a
+redirect subclass swaps the `model_id` at instantiation. The
+existing `RFDETRObjectDetection` / `RFDETRInstanceSegmentation`
+cache-first loader picks up the staged files without an API call.
+12 adapter tests + 11 registry tests passing.**
+
+Still gated:
+
 - License-class enforcement at load time (provider surfaces it; AutoModel
   refusal is a separate hook in `inference_models.access_managers`)
 - Bundle signature verification at load time (re-runs Studio's

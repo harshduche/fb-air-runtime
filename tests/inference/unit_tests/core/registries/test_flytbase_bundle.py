@@ -87,13 +87,51 @@ def test_decorator_delegates_non_bundle_ids():
     wrapped.get_model.assert_called_once_with("workspace/project/3", "k")
 
 
-def test_decorator_intercepts_bundle_id_and_signals_phase3_gap(staged_bundle):
+def test_decorator_intercepts_bundle_id_and_delegates_with_synthetic_endpoint(
+    tmp_path, monkeypatch
+):
+    """End-to-end happy path: bundle URI → stage → wrapped registry sees
+    the synthetic Roboflow-shaped endpoint, not the bundle URI."""
+    import yaml
+
+    cache = tmp_path / "cache"
+    bundle_root = cache / "tmpl" / "0.1.0"
+    (bundle_root / "model").mkdir(parents=True)
+    (bundle_root / "model" / "weights.onnx").write_bytes(b"\x00")
+    manifest = {
+        "template": {
+            "name": "tmpl",
+            "version": "0.1.0",
+            "kind": "object-detection",
+            "classes": ["car", "person"],
+        },
+        "provenance": {"distillation_target": "rf-detr-base"},
+    }
+    (bundle_root / "manifest.yaml").write_text(yaml.safe_dump(manifest))
+
+    model_cache = tmp_path / "model_cache"
+    monkeypatch.setenv("FLYTBASE_BUNDLE_CACHE_DIR", str(cache))
+    monkeypatch.delenv("FLYTBASE_ACTIVE_BUNDLE_ROOT", raising=False)
+    monkeypatch.setattr(
+        "inference.core.registries.flytbase_bundle_adapter.MODEL_CACHE_DIR",
+        str(model_cache),
+    )
+
+    class FakeBaseModel:
+        def __init__(self, model_id, *args, **kwargs):
+            self.received_model_id = model_id
+
     wrapped = MagicMock()
     wrapped.registry_dict = {}
+    wrapped.get_model.return_value = FakeBaseModel
     reg = FlytBaseBundleRegistry(wrapped=wrapped)
-    with pytest.raises(BundleResolutionError) as ei:
-        reg.get_model(
-            "bundle://template/0.1.0/model/weights.onnx", api_key=""
-        )
-    assert "LocalONNXModel" in str(ei.value)
-    wrapped.get_model.assert_not_called()
+
+    out = reg.get_model(
+        "bundle://tmpl/0.1.0/model/weights.onnx", api_key="x"
+    )
+    wrapped.get_model.assert_called_once()
+    delegated_id = wrapped.get_model.call_args[0][0]
+    assert delegated_id == "flytbase-tmpl/0.1.0"
+    assert out._flytbase_endpoint == "flytbase-tmpl/0.1.0"
+    instance = out(model_id="bundle://tmpl/0.1.0/model/weights.onnx")
+    assert instance.received_model_id == "flytbase-tmpl/0.1.0"

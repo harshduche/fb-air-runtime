@@ -200,18 +200,16 @@ class FlytBaseBundleRegistry(ModelRegistry):
 
     def get_model(self, model_id: str, api_key: str = "", **kwargs) -> Model:
         if model_id.startswith(_BUNDLE_SCHEME):
-            local_path = resolve_bundle_uri(model_id)
-            # The downstream ModelManager.add_model still expects a Roboflow
-            # task-typed model class. We can't fully bypass that without a
-            # larger refactor; for now emit a clear error directing users
-            # to the planned `LocalONNXModel` adapter, AND document the
-            # local path so the operator can pre-load the model via
-            # /model/add with `MODEL_CACHE_DIR` symlinks.
-            raise BundleResolutionError(
-                f"bundle:// resolved to local file {local_path}; "
-                f"`LocalONNXModel` registration is gated on Edge Phase 3 work "
-                f"item 2 (D6). For now, symlink the file under MODEL_CACHE_DIR "
-                f"and reference it by Roboflow model_id, or wait for the "
-                f"Phase 3 weights-provider PR."
+            # Local import — keeps yaml + adapter-side imports lazy so the
+            # decorator stays usable in test envs that don't pull yaml.
+            from inference.core.registries.flytbase_bundle_adapter import (
+                make_redirect_class,
+                stage_bundle_for_engine,
             )
+
+            synthetic_endpoint, _ = stage_bundle_for_engine(model_id)
+            wrapped_cls = self._wrapped.get_model(
+                synthetic_endpoint, api_key=api_key, **kwargs
+            )
+            return make_redirect_class(wrapped_cls, synthetic_endpoint)
         return self._wrapped.get_model(model_id, api_key, **kwargs)

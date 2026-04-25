@@ -292,15 +292,21 @@ PR draft: [`flytbase/pr_drafts/flytbase_bundle_registry.md`](../pr_drafts/flytba
   scheme, empty URI — plus 3 covering decorator delegation +
   bundle-id interception). `pytest` clean inside `flytbase-infer-v122`.
 
+**Done (2026-04-26 follow-up)**:
+
+- ✅ **Local-bundle adapter** (`inference/core/registries/flytbase_bundle_adapter.py`):
+  `bundle://` → bundle root → manifest read → stage `weights.onnx`
+  symlink + synthesised `environment.json` + `class_names.txt` +
+  `model_type.json` under `MODEL_CACHE_DIR/flytbase-<template>/<version>/`.
+  `FlytBaseBundleRegistry.get_model` then delegates to the wrapped
+  Roboflow registry with the synthetic endpoint, and a redirect
+  subclass swaps the `model_id` at instantiation time so the regular
+  `RFDETRObjectDetection` / `RFDETRInstanceSegmentation` cache-first
+  loader picks up the staged files without an API call. 12 adapter
+  tests + 11 registry tests passing inside `flytbase-infer-v122-bundle`.
+
 **Still on the builder/edge side**:
 
-- **`LocalONNXModel` adapter** (the hard part): today the decorator's
-  `get_model` resolves the URI to a real path then **raises
-  `BundleResolutionError`** because the downstream `ModelManager.add_model`
-  expects a Roboflow task-typed model class (which itself fetches
-  weights from the Roboflow API in `__init__`). The full integration
-  needs a local-file model class that skips the metadata API. PR
-  draft tags this as Edge Phase 3 work item 2 (D6).
 - **License-class gating per D10**: provider surfaces
   `runtime_compatibility` in `model_features` but enforcement is a
   follow-up hook in `inference_models.access_managers`.
@@ -309,8 +315,12 @@ PR draft: [`flytbase/pr_drafts/flytbase_bundle_registry.md`](../pr_drafts/flytba
 - **`inference_models` provider registration**: the symmetric
   `register_model_provider("flytbase_bundle", ...)` for the newer
   `AutoModel.from_pretrained` route isn't in any startup hook yet.
-  Lower priority — production probably consolidates onto the legacy
-  route until upstream finishes its migration.
+  Lower priority — the legacy registry route now works end-to-end
+  via the staging adapter.
+- **End-to-end smoke against a real Studio bundle**: container
+  restart + a staged `.flyttmpl` + a workflow referencing
+  `bundle://...` model_id. Mechanically straightforward; tracked
+  separately because it needs a fresh container boot.
 
 ### What this means for the two-runtime story
 
