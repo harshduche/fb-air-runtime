@@ -1,0 +1,25 @@
+{
+  "name": "Count Per Frame",
+  "description": "Detect a single class (default: person) and read the per-frame count off the chip pill above the visual. Useful for crowd-density alerts at a drone dock or muster point. Change `class_filter` in the Detect block to count cars, trucks, etc.",
+  "specification": {
+    "version": "1.0",
+    "inputs": [
+      { "type": "WorkflowImage", "name": "image" },
+      { "type": "WorkflowParameter", "name": "min_confidence", "default_value": 0.35 }
+    ],
+    "steps": [
+      {
+        "type": "roboflow_core/roboflow_object_detection_model@v1",
+        "name": "model",
+        "images": "$inputs.image",
+        "model_id": "yolov8n-640",
+        "confidence": "$inputs.min_confidence",
+        "class_filter": ["person"]
+      }
+    ],
+    "outputs": [
+      { "type": "JsonField", "name": "image", "selector": "$inputs.image" },
+      { "type": "JsonField", "name": "predictions", "selector": "$steps.model.predictions" }
+    ]
+  }
+}

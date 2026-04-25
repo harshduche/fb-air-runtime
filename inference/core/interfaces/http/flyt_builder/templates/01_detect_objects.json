@@ -1,0 +1,24 @@
+{
+  "name": "Detect Objects",
+  "description": "Run a fast COCO detector (YOLOv8 nano, 640px) over an image or stream. The Run panel draws boxes, labels, and confidences client-side — no server-side visualizer needed. Edit the Detect block to swap the model or tighten confidence.",
+  "specification": {
+    "version": "1.0",
+    "inputs": [
+      { "type": "WorkflowImage", "name": "image" },
+      { "type": "WorkflowParameter", "name": "min_confidence", "default_value": 0.4 }
+    ],
+    "steps": [
+      {
+        "type": "roboflow_core/roboflow_object_detection_model@v1",
+        "name": "model",
+        "images": "$inputs.image",
+        "model_id": "yolov8n-640",
+        "confidence": "$inputs.min_confidence"
+      }
+    ],
+    "outputs": [
+      { "type": "JsonField", "name": "image", "selector": "$inputs.image" },
+      { "type": "JsonField", "name": "predictions", "selector": "$steps.model.predictions" }
+    ]
+  }
+}

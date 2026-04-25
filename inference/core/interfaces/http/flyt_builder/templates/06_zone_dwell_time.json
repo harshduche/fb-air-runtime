@@ -1,0 +1,44 @@
+{
+  "name": "Zone Dwell Time",
+  "description": "Detect people, track them, and measure time spent inside a polygon zone. Server paints the zone outline; bboxes and tracker IDs come from the client overlay. Use a Stream source so dwell time accumulates. Edit `zone` (4+ corner points) to fit your area.",
+  "specification": {
+    "version": "1.0",
+    "inputs": [
+      { "type": "WorkflowImage", "name": "image" },
+      { "type": "WorkflowParameter", "name": "min_confidence", "default_value": 0.3 }
+    ],
+    "steps": [
+      {
+        "type": "roboflow_core/roboflow_object_detection_model@v1",
+        "name": "detector",
+        "images": "$inputs.image",
+        "model_id": "yolov8n-640",
+        "confidence": "$inputs.min_confidence",
+        "class_filter": ["person"]
+      },
+      {
+        "type": "roboflow_core/byte_tracker@v3",
+        "name": "tracker",
+        "image": "$inputs.image",
+        "detections": "$steps.detector.predictions"
+      },
+      {
+        "type": "roboflow_core/time_in_zone@v3",
+        "name": "dwell",
+        "image": "$inputs.image",
+        "detections": "$steps.tracker.tracked_detections",
+        "zone": [[160, 120], [480, 120], [480, 360], [160, 360]]
+      },
+      {
+        "type": "roboflow_core/polygon_zone_visualization@v1",
+        "name": "zone_paint",
+        "image": "$inputs.image",
+        "zone": [[160, 120], [480, 120], [480, 360], [160, 360]]
+      }
+    ],
+    "outputs": [
+      { "type": "JsonField", "name": "scene", "selector": "$steps.zone_paint.image" },
+      { "type": "JsonField", "name": "predictions", "selector": "$steps.dwell.timed_detections" }
+    ]
+  }
+}

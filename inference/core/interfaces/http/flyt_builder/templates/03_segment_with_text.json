@@ -1,0 +1,25 @@
+{
+  "name": "Segment With Text",
+  "description": "Prompt SAM 3 with freeform class names (comma-separated, e.g. 'person, car, truck') and get instance masks. The Run panel renders each polygon with class color. Use the Masks toggle to compare with raw bboxes.",
+  "specification": {
+    "version": "1.0",
+    "inputs": [
+      { "type": "WorkflowImage", "name": "image" },
+      { "type": "WorkflowParameter", "name": "classes", "default_value": "person, car" },
+      { "type": "WorkflowParameter", "name": "threshold", "default_value": 0.5 }
+    ],
+    "steps": [
+      {
+        "type": "roboflow_core/sam3@v1",
+        "name": "sam",
+        "images": "$inputs.image",
+        "class_names": "$inputs.classes",
+        "threshold": "$inputs.threshold"
+      }
+    ],
+    "outputs": [
+      { "type": "JsonField", "name": "image", "selector": "$inputs.image" },
+      { "type": "JsonField", "name": "predictions", "selector": "$steps.sam.predictions" }
+    ]
+  }
+}
