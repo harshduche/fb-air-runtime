@@ -37,6 +37,20 @@ if os.environ.get("FLYTBASE_BUNDLE_REGISTRY_ENABLED", "0") == "1":
     model_registry = FlytBaseBundleRegistry(wrapped=model_registry)
     logger.info("FlytBaseBundleRegistry wired around RoboflowModelRegistry")
 
+    # Opting into the bundle registry implicitly enables both load-time
+    # gates. License (D10) and signature verification are part of the
+    # bundle contract — a deployment that loads `bundle://` URIs without
+    # them has no enforcement point for `restricted` bundles or tampered
+    # manifests. Either gate can still be explicitly disabled by setting
+    # the env var to "0" (operator escape valve during emergencies).
+    os.environ.setdefault("FLYTBASE_LICENSE_GATE_ENABLED", "1")
+    os.environ.setdefault("FLYTBASE_SIGNATURE_VERIFY_ENABLED", "1")
+    logger.info(
+        "Bundle load-time gates default ON: license=%s signature=%s",
+        os.environ["FLYTBASE_LICENSE_GATE_ENABLED"],
+        os.environ["FLYTBASE_SIGNATURE_VERIFY_ENABLED"],
+    )
+
     # Mirror wiring on the AutoModel weights-provider path.
     # The workflow engine here uses `inference_models.AutoModel.from_pretrained`
     # for detector blocks rather than the legacy ModelManager registry,
