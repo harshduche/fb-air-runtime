@@ -17,6 +17,9 @@ from typing import List, Type
 
 from inference.core.workflows.prototypes.block import WorkflowBlock
 
+from flytbase_workflow_blocks.dashboard_widget_sink.v1 import (
+    DashboardWidgetSinkBlockV1,
+)
 from flytbase_workflow_blocks.object_count_threshold_alert.v1 import (
     ObjectCountThresholdAlertBlockV1,
 )
@@ -26,4 +29,5 @@ def load_blocks() -> List[Type[WorkflowBlock]]:
     """Plugin entry point — returns FlytBase blocks for the engine to register."""
     return [
         ObjectCountThresholdAlertBlockV1,
+        DashboardWidgetSinkBlockV1,
     ]
