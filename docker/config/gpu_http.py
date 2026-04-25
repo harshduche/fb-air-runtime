@@ -1,4 +1,5 @@
 import multiprocessing
+import os
 from functools import partial
 
 from inference.core.cache import cache
@@ -11,12 +12,14 @@ from inference.core.env import (
 )
 from inference.core.interfaces.http.http_api import HttpInterface
 from inference.core.interfaces.stream_manager.manager_app.app import start
+from inference.core.logger import logger
 from inference.core.managers.active_learning import (
     ActiveLearningManager,
     BackgroundTaskActiveLearningManager,
 )
 from inference.core.managers.base import ModelManager
 from inference.core.managers.decorators.fixed_size_cache import WithFixedSizeCache
+from inference.core.registries.flytbase_bundle import FlytBaseBundleRegistry
 from inference.core.registries.roboflow import (
     RoboflowModelRegistry,
 )
@@ -30,6 +33,9 @@ if ENABLE_STREAM_API:
     stream_manager_process.start()
 
 model_registry = RoboflowModelRegistry(ROBOFLOW_MODEL_TYPES)
+if os.environ.get("FLYTBASE_BUNDLE_REGISTRY_ENABLED", "0") == "1":
+    model_registry = FlytBaseBundleRegistry(wrapped=model_registry)
+    logger.info("FlytBaseBundleRegistry wired around RoboflowModelRegistry")
 
 if ACTIVE_LEARNING_ENABLED:
     if LAMBDA:
