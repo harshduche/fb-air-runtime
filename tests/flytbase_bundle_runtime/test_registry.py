@@ -2,7 +2,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from inference.core.registries.flytbase_bundle import (
+from flytbase_bundle_runtime.registry import (
     BundleResolutionError,
     FlytBaseBundleRegistry,
     resolve_bundle_uri,
@@ -118,7 +118,7 @@ def test_decorator_intercepts_bundle_id_and_delegates_with_synthetic_endpoint(
     monkeypatch.setenv("FLYTBASE_BUNDLE_CACHE_DIR", str(cache))
     monkeypatch.delenv("FLYTBASE_ACTIVE_BUNDLE_ROOT", raising=False)
     monkeypatch.setattr(
-        "inference.core.registries.flytbase_bundle_adapter.MODEL_CACHE_DIR",
+        "flytbase_bundle_runtime.adapter.MODEL_CACHE_DIR",
         str(model_cache),
     )
 

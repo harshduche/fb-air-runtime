@@ -19,7 +19,7 @@ from inference.core.managers.active_learning import (
 )
 from inference.core.managers.base import ModelManager
 from inference.core.managers.decorators.fixed_size_cache import WithFixedSizeCache
-from inference.core.registries.flytbase_bundle import FlytBaseBundleRegistry
+from flytbase_bundle_runtime.registry import FlytBaseBundleRegistry
 from inference.core.registries.roboflow import (
     RoboflowModelRegistry,
 )
@@ -72,7 +72,7 @@ if os.environ.get("FLYTBASE_BUNDLE_REGISTRY_ENABLED", "0") == "1":
     # for detector blocks rather than the legacy ModelManager registry,
     # so the registry wrap above is necessary but not sufficient.
     from inference_models.weights_providers.core import WEIGHTS_PROVIDERS
-    from inference_models.weights_providers.flytbase_bundle_provider import (
+    from flytbase_bundle_runtime.auto_model_provider import (
         get_flytbase_bundle_model,
     )
 

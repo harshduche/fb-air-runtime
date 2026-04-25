@@ -5,14 +5,14 @@ import pytest
 import yaml
 
 from inference.core.exceptions import ModelNotRecognisedError
-from inference.core.registries.flytbase_bundle import BundleResolutionError
-from inference.core.registries.flytbase_bundle_adapter import (
+from flytbase_bundle_runtime.adapter import (
     _build_environment_json,
     _extract_classes,
     _resolve_task_and_model_type,
     make_redirect_class,
     stage_bundle_for_engine,
 )
+from flytbase_bundle_runtime.registry import BundleResolutionError
 
 
 def _write_bundle(
@@ -54,7 +54,7 @@ def staged_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("FLYTBASE_BUNDLE_CACHE_DIR", str(cache))
     monkeypatch.delenv("FLYTBASE_ACTIVE_BUNDLE_ROOT", raising=False)
     monkeypatch.setattr(
-        "inference.core.registries.flytbase_bundle_adapter.MODEL_CACHE_DIR",
+        "flytbase_bundle_runtime.adapter.MODEL_CACHE_DIR",
         str(model_cache),
     )
     return {
@@ -159,7 +159,7 @@ def test_stage_segmentation_bundle_picks_segmentation_model_type(
     monkeypatch.setenv("FLYTBASE_BUNDLE_CACHE_DIR", str(cache))
     monkeypatch.delenv("FLYTBASE_ACTIVE_BUNDLE_ROOT", raising=False)
     monkeypatch.setattr(
-        "inference.core.registries.flytbase_bundle_adapter.MODEL_CACHE_DIR",
+        "flytbase_bundle_runtime.adapter.MODEL_CACHE_DIR",
         str(model_cache),
     )
 

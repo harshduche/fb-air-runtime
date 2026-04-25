@@ -8,11 +8,11 @@ cache pre-staged from `.flyttmpl` archives published by AI-R Studio.
 Activation
 ==========
 
-In `inference/core/registries/__init__.py` (or wherever the active
-ModelRegistry is constructed), wrap the existing registry::
+In `docker/config/gpu_http.py` (where the active ModelRegistry is
+constructed), wrap the existing registry::
 
     from inference.core.registries.roboflow import RoboflowModelRegistry
-    from inference.core.registries.flytbase_bundle import FlytBaseBundleRegistry
+    from flytbase_bundle_runtime.registry import FlytBaseBundleRegistry
 
     base = RoboflowModelRegistry(...)
     REGISTRY = FlytBaseBundleRegistry(wrapped=base)
@@ -202,13 +202,13 @@ class FlytBaseBundleRegistry(ModelRegistry):
         if model_id.startswith(_BUNDLE_SCHEME):
             # Local imports keep yaml + cryptography lazy for test envs
             # that don't need them when the bundle path isn't exercised.
-            from inference.core.registries.flytbase_bundle_adapter import (
+            from flytbase_bundle_runtime.adapter import (
                 _read_manifest,
                 get_legacy_class_for_bundle,
                 make_redirect_class,
                 stage_bundle_for_engine,
             )
-            from inference.core.registries.flytbase_bundle_gates import (
+            from flytbase_bundle_runtime.gates import (
                 check_license,
                 verify_signature,
             )

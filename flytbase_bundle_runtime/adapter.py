@@ -29,7 +29,7 @@ import yaml
 
 from inference.core.env import MODEL_CACHE_DIR
 from inference.core.exceptions import ModelNotRecognisedError
-from inference.core.registries.flytbase_bundle import (
+from flytbase_bundle_runtime.registry import (
     BundleResolutionError,
     resolve_bundle_uri,
 )
