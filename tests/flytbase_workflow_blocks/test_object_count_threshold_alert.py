@@ -1,7 +1,7 @@
 import numpy as np
 import supervision as sv
 
-from inference.core.workflows.core_steps.flytbase.object_count_threshold_alert.v1 import (
+from flytbase_workflow_blocks.object_count_threshold_alert.v1 import (
     OUTPUT_KEY_ALERT,
     OUTPUT_KEY_COUNT,
     OUTPUT_KEY_MESSAGE,

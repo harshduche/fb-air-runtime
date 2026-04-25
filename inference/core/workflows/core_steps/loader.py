@@ -23,9 +23,6 @@ from inference.core.workflows.core_steps.analytics.line_counter.v1 import (
 from inference.core.workflows.core_steps.analytics.line_counter.v2 import (
     LineCounterBlockV2,
 )
-from inference.core.workflows.core_steps.flytbase.object_count_threshold_alert.v1 import (
-    ObjectCountThresholdAlertBlockV1,
-)
 from inference.core.workflows.core_steps.analytics.overlap.v1 import OverlapBlockV1
 from inference.core.workflows.core_steps.analytics.path_deviation.v1 import (
     PathDeviationAnalyticsBlockV1,
@@ -787,7 +784,6 @@ def load_blocks() -> List[Type[WorkflowBlock]]:
         ClassificationLabelVisualizationBlockV1,
         LineCounterBlockV1,
         LineCounterBlockV2,
-        ObjectCountThresholdAlertBlockV1,
         LineCounterZoneVisualizationBlockV1,
         MaskVisualizationBlockV1,
         ModelComparisonVisualizationBlockV1,

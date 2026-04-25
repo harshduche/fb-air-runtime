@@ -105,9 +105,14 @@ def test_decorator_intercepts_bundle_id_and_delegates_with_synthetic_endpoint(
             "kind": "object-detection",
             "classes": ["car", "person"],
         },
+        "license": {"runtime_compatibility": "open"},
         "provenance": {"distillation_target": "rf-detr-base"},
     }
     (bundle_root / "manifest.yaml").write_text(yaml.safe_dump(manifest))
+    # Ensure neither inherited env enables gates during this test —
+    # the test fixture exercises the registry plumbing, not gate policy.
+    monkeypatch.delenv("FLYTBASE_LICENSE_GATE_ENABLED", raising=False)
+    monkeypatch.delenv("FLYTBASE_SIGNATURE_VERIFY_ENABLED", raising=False)
 
     model_cache = tmp_path / "model_cache"
     monkeypatch.setenv("FLYTBASE_BUNDLE_CACHE_DIR", str(cache))

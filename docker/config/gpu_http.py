@@ -32,6 +32,22 @@ if ENABLE_STREAM_API:
     )
     stream_manager_process.start()
 
+# Auto-register the FlytBase workflow-blocks plugin so the engine
+# discovers `flytbase/*` blocks without modifying upstream's
+# `core_steps/loader.py`. Operators can override by setting an explicit
+# WORKFLOWS_PLUGINS list in their environment.
+_existing_plugins = os.environ.get("WORKFLOWS_PLUGINS")
+if not _existing_plugins:
+    os.environ["WORKFLOWS_PLUGINS"] = "flytbase_workflow_blocks"
+elif "flytbase_workflow_blocks" not in _existing_plugins.split(","):
+    os.environ["WORKFLOWS_PLUGINS"] = (
+        _existing_plugins + ",flytbase_workflow_blocks"
+    )
+logger.info(
+    "WORKFLOWS_PLUGINS=%s (FlytBase blocks loaded via plugin contract)",
+    os.environ["WORKFLOWS_PLUGINS"],
+)
+
 model_registry = RoboflowModelRegistry(ROBOFLOW_MODEL_TYPES)
 if os.environ.get("FLYTBASE_BUNDLE_REGISTRY_ENABLED", "0") == "1":
     model_registry = FlytBaseBundleRegistry(wrapped=model_registry)
