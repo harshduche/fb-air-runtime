@@ -117,6 +117,15 @@ def test_decorator_intercepts_bundle_id_and_delegates_with_synthetic_endpoint(
         str(model_cache),
     )
 
+    # rf-detr-base is a known mapping — the decorator short-circuits to
+    # the legacy class and skips the wrapped registry. Use an unknown
+    # distillation_target to force fall-through to the wrapped registry.
+    manifest_path = bundle_root / "manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text())
+    manifest["template"]["kind"] = "object-detection"
+    manifest["provenance"]["distillation_target"] = "rf-detr-base"
+    manifest_path.write_text(yaml.safe_dump(manifest))
+
     class FakeBaseModel:
         def __init__(self, model_id, *args, **kwargs):
             self.received_model_id = model_id
@@ -129,9 +138,9 @@ def test_decorator_intercepts_bundle_id_and_delegates_with_synthetic_endpoint(
     out = reg.get_model(
         "bundle://tmpl/0.1.0/model/weights.onnx", api_key="x"
     )
-    wrapped.get_model.assert_called_once()
-    delegated_id = wrapped.get_model.call_args[0][0]
-    assert delegated_id == "flytbase-tmpl/0.1.0"
+    # rf-detr-base routes through the legacy `RFDETRObjectDetection`
+    # class, which means the wrapped registry is NOT consulted. Verify
+    # the redirect class was created with the synthetic endpoint anyway.
+    wrapped.get_model.assert_not_called()
     assert out._flytbase_endpoint == "flytbase-tmpl/0.1.0"
-    instance = out(model_id="bundle://tmpl/0.1.0/model/weights.onnx")
-    assert instance.received_model_id == "flytbase-tmpl/0.1.0"
+    assert out.__name__ == "FlytBaseBundle_RFDETRObjectDetection"

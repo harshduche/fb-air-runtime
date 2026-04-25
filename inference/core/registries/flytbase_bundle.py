@@ -203,13 +203,18 @@ class FlytBaseBundleRegistry(ModelRegistry):
             # Local import — keeps yaml + adapter-side imports lazy so the
             # decorator stays usable in test envs that don't pull yaml.
             from inference.core.registries.flytbase_bundle_adapter import (
+                get_legacy_class_for_bundle,
                 make_redirect_class,
                 stage_bundle_for_engine,
             )
 
-            synthetic_endpoint, _ = stage_bundle_for_engine(model_id)
-            wrapped_cls = self._wrapped.get_model(
-                synthetic_endpoint, api_key=api_key, **kwargs
+            synthetic_endpoint, (task_type, model_type) = stage_bundle_for_engine(
+                model_id
             )
-            return make_redirect_class(wrapped_cls, synthetic_endpoint)
+            base_cls = get_legacy_class_for_bundle(task_type, model_type)
+            if base_cls is None:
+                base_cls = self._wrapped.get_model(
+                    synthetic_endpoint, api_key=api_key, **kwargs
+                )
+            return make_redirect_class(base_cls, synthetic_endpoint)
         return self._wrapped.get_model(model_id, api_key, **kwargs)

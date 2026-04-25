@@ -75,6 +75,18 @@ def test_resolve_task_and_model_type_known_pair():
     )
 
 
+def test_resolve_task_and_model_type_short_kind_form():
+    """Studio writes template.kind='detection' (short form) in some paths."""
+    manifest = {
+        "template": {"kind": "detection"},
+        "provenance": {"distillation_target": "rf-detr-base"},
+    }
+    assert _resolve_task_and_model_type(manifest) == (
+        "object-detection",
+        "rfdetr-base",
+    )
+
+
 def test_resolve_task_and_model_type_unknown_pair_raises():
     manifest = {
         "template": {"kind": "object-detection"},

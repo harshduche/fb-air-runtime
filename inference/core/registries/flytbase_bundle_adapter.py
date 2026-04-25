@@ -35,9 +35,18 @@ from inference.core.registries.flytbase_bundle import (
 )
 
 
-# Studio's `(template.kind, provenance.distillation_target)` →
-# Roboflow registry's `(task_type, model_type)`. Extend as more
-# distillation targets land in Studio.
+# Studio's `template.kind` uses both short ("detection", "segmentation")
+# and long ("object-detection", "instance-segmentation") forms across
+# different writer paths — normalise before lookup.
+_KIND_NORMALISE: Dict[str, str] = {
+    "detection": "object-detection",
+    "object-detection": "object-detection",
+    "segmentation": "instance-segmentation",
+    "instance-segmentation": "instance-segmentation",
+}
+
+# Normalised `(task_type, distillation_target)` → Roboflow registry's
+# `(task_type, model_type)`. Extend as more distillation targets land.
 _STUDIO_TO_ROBOFLOW: Dict[Tuple[str, str], Tuple[str, str]] = {
     ("object-detection", "rf-detr-base"): ("object-detection", "rfdetr-base"),
     ("object-detection", "rf-detr-nano"): ("object-detection", "rfdetr-nano"),
@@ -72,14 +81,15 @@ def _read_manifest(bundle_root: Path) -> Dict[str, Any]:
 def _resolve_task_and_model_type(manifest: Dict[str, Any]) -> Tuple[str, str]:
     template = manifest.get("template") or {}
     provenance = manifest.get("provenance") or {}
-    kind = template.get("kind") or "object-detection"
+    raw_kind = template.get("kind") or "object-detection"
+    kind = _KIND_NORMALISE.get(raw_kind, raw_kind)
     distillation = provenance.get("distillation_target") or ""
     pair = _STUDIO_TO_ROBOFLOW.get((kind, distillation))
     if pair is not None:
         return pair
     raise ModelNotRecognisedError(
         f"Studio bundle has unrecognised "
-        f"(template.kind={kind!r}, "
+        f"(template.kind={raw_kind!r}, "
         f"provenance.distillation_target={distillation!r}); "
         f"register a mapping in flytbase_bundle_adapter._STUDIO_TO_ROBOFLOW"
     )
@@ -188,3 +198,26 @@ def make_redirect_class(parent_cls: type, synthetic_endpoint: str) -> type:
     _FlytBaseBundleRedirect.__name__ = f"FlytBaseBundle_{parent_cls.__name__}"
     _FlytBaseBundleRedirect.__qualname__ = _FlytBaseBundleRedirect.__name__
     return _FlytBaseBundleRedirect
+
+
+# Force-route `bundle://` loads to the legacy concrete classes (which
+# read from MODEL_CACHE_DIR/<endpoint>/) rather than the
+# `InferenceModelsObjectDetectionAdapter` that the wrapped registry
+# returns when `USE_INFERENCE_MODELS=True`. AutoModel's auto-negotiation
+# doesn't yet have an `(rfdetr, onnx, flytbase.*)` package match, so the
+# adapter would refuse the load. The legacy class works because the
+# staging step already populated its expected cache layout.
+def get_legacy_class_for_bundle(task_type: str, model_type: str):
+    """Return the legacy ONNX class for a `(task_type, model_type)` pair,
+    or `None` if the bundle should fall through to the wrapped registry's
+    default class. Local imports keep startup costs lean.
+    """
+    if task_type == "object-detection" and model_type.startswith("rfdetr"):
+        from inference.models.rfdetr.rfdetr import RFDETRObjectDetection
+
+        return RFDETRObjectDetection
+    if task_type == "instance-segmentation" and model_type.startswith("rfdetr"):
+        from inference.models.rfdetr.rfdetr import RFDETRInstanceSegmentation
+
+        return RFDETRInstanceSegmentation
+    return None
