@@ -140,6 +140,22 @@ export function FloatingInspector({
         </button>
       </div>
       <div className="floating-inspector-body">
+        {node.data.issues && node.data.issues.length > 0 && (
+          <div className="inspector-issues">
+            <div className="hd">
+              {node.data.issues.length} issue
+              {node.data.issues.length === 1 ? "" : "s"} on this step
+            </div>
+            <ul>
+              {node.data.issues.map((it, i) => (
+                <li key={i} className={it.severity}>
+                  {it.field && <code className="fld">{it.field}</code>}
+                  <span>{it.message}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         <Inspector
           node={node}
           onChange={onChange}

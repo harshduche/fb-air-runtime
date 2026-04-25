@@ -47,7 +47,11 @@ becomes a migration project. Every field name, every default value,
 every directory convention.
 
 **Stance**: proposal drafted, awaiting PM review. Implementation blocked
-until sign-off.
+until sign-off. As of 2026-04-25 the flow builder ships an interim **v0
+slice** (workflow spec + manifest + README only — no model weights,
+widgets, alerts, fixtures, card) under `schema_version: "flyttmpl/v0"`,
+documented in [10_flyttmpl_v0_schema.md](10_flyttmpl_v0_schema.md). v0
+is explicitly an iteration anchor, not a substitute for D3 sign-off.
 
 **Sign-off needed**: PM, architect, at least one partner team that will
 ship a template. Customer ML teams that will produce private templates

@@ -3,9 +3,10 @@
 // preview, and lets the user create / open / rename / duplicate / delete
 // without ever typing an ID into a prompt.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteWorkflow,
+  importBundle,
   listTemplates,
   listWorkflows,
   loadWorkflow,
@@ -141,6 +142,45 @@ export function Dashboard({ onOpen }: Props) {
     onOpen(id);
   }, [existingIds, onOpen]);
 
+  // Hidden <input type=file> we trigger from the Import button — the
+  // standard click-the-button-then-pick-a-file pattern. After upload
+  // we navigate the new workflow into the builder.
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+  const [importing, setImporting] = useState(false);
+  const onImportClick = useCallback(() => {
+    importInputRef.current?.click();
+  }, []);
+  const onImportFile = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const f = e.target.files?.[0];
+      e.target.value = "";
+      if (!f) return;
+      setImporting(true);
+      try {
+        const r = await importBundle(f);
+        await refresh();
+        const note = r.fixtures_count > 0
+          ? ` (+${r.fixtures_count} fixture${r.fixtures_count === 1 ? "" : "s"})`
+          : "";
+        // Small delay so the user sees the import succeeded before
+        // we redirect to the builder.
+        setTimeout(() => onOpen(r.id), 50);
+        // The toast survives the navigation only briefly — for a
+        // notice the user can read, prefer alert.
+        if (r.id !== (r.source.provenance?.workflow_id || r.id)) {
+          alert(
+            `Imported as '${r.id}'${note} (renamed because the original id was taken).`,
+          );
+        }
+      } catch (err: any) {
+        alert(`Import failed: ${err?.message || err}`);
+      } finally {
+        setImporting(false);
+      }
+    },
+    [refresh, onOpen],
+  );
+
   const onDelete = useCallback(
     async (id: string) => {
       if (!window.confirm(`Delete workflow '${id}'? This cannot be undone.`)) return;
@@ -255,6 +295,21 @@ export function Dashboard({ onOpen }: Props) {
         <button className="btn primary" onClick={onCreate}>
           + Create Workflow
         </button>
+        <button
+          className="btn"
+          onClick={onImportClick}
+          disabled={importing}
+          title="Load a .flyttmpl.tar.gz bundle as a new workflow"
+        >
+          {importing ? "Importing…" : "↑ Import .flyttmpl"}
+        </button>
+        <input
+          ref={importInputRef}
+          type="file"
+          accept=".flyttmpl,.tar.gz,.gz,application/gzip,application/x-gzip,application/x-tar"
+          style={{ display: "none" }}
+          onChange={onImportFile}
+        />
         <a
           href="/build"
           className="compare"

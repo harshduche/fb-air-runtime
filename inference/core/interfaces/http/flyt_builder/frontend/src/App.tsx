@@ -24,18 +24,21 @@ import {
   BlockDef,
   BlocksDescribeResponse,
   describeBlocks,
+  downloadBundle,
   loadWorkflowMeta,
   publishWorkflow,
   saveWorkflow,
 } from "./api";
 import {
   FlytNodeData,
+  WorkflowIssues,
   autoWireFields,
   compileWorkflow,
   defaultDataForBlock,
   nameOf,
   outputsByName,
   validateRequiredFields,
+  validateWorkflow,
 } from "./compile";
 import { FloatingInspector } from "./FloatingInspector";
 import { Palette } from "./Palette";
@@ -46,6 +49,13 @@ import { RunPanel, InputDef, InputSource } from "./RunPanel";
 import { VersionHistory } from "./VersionHistory";
 import { Resizer } from "./Resizer";
 import { layoutVertical } from "./layout";
+import {
+  BudgetEstimate,
+  DEFAULT_BUDGET_MB,
+  estimateWorkflowVram,
+  formatVram,
+  severityFor,
+} from "./budget";
 import flytbaseMotif from "./assets/flytbase-motif.svg";
 
 type Status =
@@ -151,8 +161,20 @@ function FbNode({ id, data, selected }: NodeProps<FlytNodeData>) {
     rf.deleteElements({ nodes: [{ id }] });
   };
 
+  const issues = data.issues || [];
+  const hasErrors = issues.some((i) => i.severity === "error");
+  const issueTooltip = issues.length
+    ? issues
+        .slice(0, 4)
+        .map((i) => (i.field ? `${i.field}: ${i.message}` : i.message))
+        .join("\n") +
+      (issues.length > 4 ? `\n…and ${issues.length - 4} more` : "")
+    : undefined;
+
   return (
-    <div className={`custom-node step-node ${selected ? "selected" : ""}`}>
+    <div
+      className={`custom-node step-node ${selected ? "selected" : ""} ${hasErrors ? "has-errors" : ""}`}
+    >
       <Handle type="target" position={Position.Top} />
       <div className="node-toolbar">
         <span
@@ -166,6 +188,15 @@ function FbNode({ id, data, selected }: NodeProps<FlytNodeData>) {
         <button onClick={duplicate} title="Duplicate">⧉</button>
         <button onClick={remove} title="Delete">×</button>
       </div>
+      {issues.length > 0 && (
+        <div
+          className={`issue-badge ${hasErrors ? "err" : "warn"}`}
+          title={issueTooltip}
+          aria-label={`${issues.length} issue${issues.length === 1 ? "" : "s"}`}
+        >
+          {hasErrors ? "!" : "?"} {issues.length}
+        </div>
+      )}
       <div className="title">
         {data.block!.human_friendly_block_name || data.block!.manifest_type_identifier}
       </div>
@@ -687,6 +718,63 @@ function BuilderInner({ workflowId, onBack }: BuilderProps) {
     [edges, openInlinePicker],
   );
 
+  // Compile the spec early — `nodesWithIssues`, `validity`, and the
+  // budget all depend on it. The save/publish path below picks up the
+  // same memoised value.
+  const compiled = useMemo(
+    () => compileWorkflow(nodes as Node<FlytNodeData>[], edges as Edge[]),
+    [nodes, edges],
+  );
+  const compiledJson = useMemo(() => JSON.stringify(compiled), [compiled]);
+
+  // VRAM estimate for the chip pill in the topbar. Re-walks the spec
+  // on any node/edge change — the cost is trivial (linear in step
+  // count). The breakdown popover reuses this value.
+  const budget: BudgetEstimate = useMemo(
+    () => estimateWorkflowVram(compiled),
+    [compiled],
+  );
+  const budgetCap = ((window as any).__FLYBUILD__?.budget_mb as number) || DEFAULT_BUDGET_MB;
+  const budgetSev = severityFor(budget.total_mb, budgetCap);
+  const [budgetOpen, setBudgetOpen] = useState(false);
+
+  // Inline validation: missing required fields + dangling refs. Drives
+  // the red border + badge in FbNode, the Issues panel in the
+  // inspector, and the topbar count chip.
+  const validity: WorkflowIssues = useMemo(
+    () => validateWorkflow(compiled, blocks),
+    [compiled, blocks],
+  );
+
+  // Overlay per-step issues onto the React Flow node data so FbNode
+  // can render the red border + count badge without re-running the
+  // validator. New object identity only when validity actually
+  // changes, so dragging nodes around doesn't re-render every node.
+  const nodesWithIssues = useMemo(
+    () =>
+      nodes.map((n) => {
+        const stepName = (n.data as FlytNodeData).stepName;
+        const issues = stepName
+          ? validity.byStep[stepName] || []
+          : [];
+        // Avoid creating a new object when nothing changed — keeps
+        // React Flow's reconciliation cheap.
+        const prevIssues = (n.data as FlytNodeData).issues || [];
+        if (
+          issues.length === prevIssues.length &&
+          issues.every(
+            (it, i) =>
+              it.message === prevIssues[i]?.message &&
+              it.field === prevIssues[i]?.field,
+          )
+        ) {
+          return n;
+        }
+        return { ...n, data: { ...n.data, issues } as FlytNodeData };
+      }),
+    [nodes, validity],
+  );
+
   const onPickInline = useCallback(
     (block: BlockDef) => {
       if (!inlinePicker) return;
@@ -770,11 +858,6 @@ function BuilderInner({ workflowId, onBack }: BuilderProps) {
 
   // ---- Save / publish ---------------------------------------------
 
-  const compiled = useMemo(
-    () => compileWorkflow(nodes as Node<FlytNodeData>[], edges as Edge[]),
-    [nodes, edges],
-  );
-  const compiledJson = useMemo(() => JSON.stringify(compiled), [compiled]);
   const dirty = useMemo(() => {
     if (savedSpecJson == null) return nodes.length > 0 || edges.length > 0;
     return savedSpecJson !== compiledJson;
@@ -805,6 +888,20 @@ function BuilderInner({ workflowId, onBack }: BuilderProps) {
       setStatus({ kind: "err", msg: `Publish failed: ${e}` });
     }
   }, [workflowId, compiled, compiledJson]);
+
+  // Download the current published version as a .flyttmpl bundle. Hits
+  // /bundle which assembles the zip on demand from the workflow's most
+  // recent published version on disk.
+  const onDownloadBundle = useCallback(async () => {
+    setStatus({ kind: "busy", msg: "Bundling…" });
+    try {
+      const { filename, size } = await downloadBundle(workflowId);
+      const kb = Math.max(1, Math.round(size / 1024));
+      setStatus({ kind: "ok", msg: `Downloaded ${filename} (${kb} KB)` });
+    } catch (e) {
+      setStatus({ kind: "err", msg: `Bundle failed: ${e}` });
+    }
+  }, [workflowId]);
 
   // Re-hydrate graph when a version is restored in the history drawer.
   const onRestored = useCallback(
@@ -999,6 +1096,103 @@ function BuilderInner({ workflowId, onBack }: BuilderProps) {
         >
           ⧗ History
         </button>
+        {validity.total > 0 && (
+          <button
+            type="button"
+            className={`issues-chip ${validity.byStep && Object.values(validity.byStep).some((arr) => arr.some((i) => i.severity === "error")) || validity.workflow.some((i) => i.severity === "error") ? "err" : "warn"}`}
+            onClick={() => {
+              // Click → focus the first node that has issues. Falls
+              // through to scrolling to a workflow-level issue if all
+              // issues are workflow-scoped.
+              const firstStepWithIssues = nodes.find(
+                (n) =>
+                  (n.data as FlytNodeData).stepName &&
+                  (validity.byStep[
+                    (n.data as FlytNodeData).stepName!
+                  ]?.length ?? 0) > 0,
+              );
+              if (firstStepWithIssues && rfInstance) {
+                rfInstance.fitView({
+                  nodes: [{ id: firstStepWithIssues.id }],
+                  duration: 300,
+                  padding: 0.4,
+                });
+                // Also select it so the inspector opens.
+                setNodes((prev) =>
+                  prev.map((n) => ({
+                    ...n,
+                    selected: n.id === firstStepWithIssues.id,
+                  })),
+                );
+              }
+            }}
+            title={`${validity.total} issue${validity.total === 1 ? "" : "s"} — click to focus the first one`}
+          >
+            ⚠ {validity.total}
+          </button>
+        )}
+        {budget.steps.length > 0 && (
+          <div className="budget-wrap">
+            <button
+              className={`budget-pill ${budgetSev}`}
+              onClick={() => setBudgetOpen((x) => !x)}
+              title={
+                budgetSev === "over"
+                  ? `Over budget: ~${formatVram(budget.total_mb)} > ${formatVram(budgetCap)}. Edge devices will OOM.`
+                  : budgetSev === "warn"
+                    ? `Tight: ~${formatVram(budget.total_mb)} of ${formatVram(budgetCap)} budget`
+                    : `Estimated VRAM. Click for breakdown.`
+              }
+            >
+              ≈ {formatVram(budget.total_mb)}
+              {budget.unknown_blocks.length > 0 && <span className="hint">?</span>}
+            </button>
+            {budgetOpen && (
+              <div
+                className="budget-popover"
+                role="dialog"
+                aria-label="VRAM breakdown"
+              >
+                <div className="hd">
+                  <span>VRAM estimate</span>
+                  <button className="x" onClick={() => setBudgetOpen(false)}>×</button>
+                </div>
+                <div className="rows">
+                  {budget.steps.map((s) => (
+                    <div className="row" key={s.step_name}>
+                      <span className="name">{s.step_name}</span>
+                      <span className="ty">
+                        {s.model_id || s.block_type.split("/").pop() || s.block_type}
+                      </span>
+                      <span className={`mb ${s.is_estimate ? "est" : ""}`}>
+                        {formatVram(s.mb)}
+                        {s.is_estimate && "*"}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="ft">
+                  <div className="total">
+                    <span>Total</span>
+                    <span className={budgetSev}>{formatVram(budget.total_mb)} / {formatVram(budgetCap)}</span>
+                  </div>
+                  {budget.unknown_blocks.length > 0 && (
+                    <div className="note">
+                      * estimated — block recipes for{" "}
+                      {budget.unknown_blocks.slice(0, 3).join(", ")}
+                      {budget.unknown_blocks.length > 3 ? ", …" : ""} not in cost
+                      table. Total may be low.
+                    </div>
+                  )}
+                  <div className="note muted">
+                    Cap is the typical FlytBase edge device's GPU
+                    headroom. Override via window.__FLYBUILD__.budget_mb.
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
         <button className="btn" onClick={onSave} disabled={!dirty}>
           Save
         </button>
@@ -1008,6 +1202,13 @@ function BuilderInner({ workflowId, onBack }: BuilderProps) {
           title="Snapshot current spec as a new version"
         >
           Publish
+        </button>
+        <button
+          className="btn"
+          onClick={onDownloadBundle}
+          title="Download the current version as a .flyttmpl bundle (workflow spec + manifest)"
+        >
+          ⬇ .flyttmpl
         </button>
         <button className="btn" onClick={onClear}>
           Clear
@@ -1049,8 +1250,20 @@ function BuilderInner({ workflowId, onBack }: BuilderProps) {
         )}
 
         <div className="canvas" onDrop={onDrop} onDragOver={onDragOver}>
+          {validity.workflow.length > 0 && (
+            <div className="workflow-issue-banner">
+              {validity.workflow.map((it, i) => (
+                <div key={i} className={`row ${it.severity}`}>
+                  <span className="ico">
+                    {it.severity === "error" ? "✕" : "⚠"}
+                  </span>
+                  <span>{it.message}</span>
+                </div>
+              ))}
+            </div>
+          )}
           <ReactFlow
-            nodes={nodes}
+            nodes={nodesWithIssues}
             edges={edgesWithHandlers as Edge[]}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
@@ -1108,6 +1321,7 @@ function BuilderInner({ workflowId, onBack }: BuilderProps) {
             <Resizer width={rightW} onChange={setRightW} side="right" />
             <div className="right-rail-wrap" style={{ width: rightW }}>
               <RunPanel
+                workflowId={workflowId}
                 workflowSpec={compiled}
                 inputs={runInputs}
                 blocks={blocks}

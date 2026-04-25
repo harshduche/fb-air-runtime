@@ -187,6 +187,154 @@ export async function restoreVersion(
   return { version: Number(d.version ?? 1) };
 }
 
+// ---- Fixtures (per-workflow scene-image library) ----
+
+export type Fixture = {
+  name: string;
+  size: number;
+  mtime: number;
+};
+
+export type FixtureLimits = {
+  max_per_workflow: number;
+  max_bytes_per_file: number;
+};
+
+export async function listFixtures(id: string): Promise<{
+  data: Fixture[];
+  limits: FixtureLimits;
+}> {
+  const res = await fetch(
+    `/flybuild/api/${encodeURIComponent(id)}/fixtures`,
+    { headers: { "X-CSRF": CSRF } },
+  );
+  if (!res.ok) throw new Error(`fixtures ${res.status}`);
+  const d = await res.json();
+  return {
+    data: Array.isArray(d.data) ? d.data : [],
+    limits: d.limits || { max_per_workflow: 0, max_bytes_per_file: 0 },
+  };
+}
+
+export async function uploadFixture(
+  id: string,
+  file: File,
+): Promise<{ name: string; size: number; replaced: boolean }> {
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  const res = await fetch(
+    `/flybuild/api/${encodeURIComponent(id)}/fixtures`,
+    { method: "POST", headers: { "X-CSRF": CSRF }, body: fd },
+  );
+  if (!res.ok) {
+    let msg = `upload ${res.status}`;
+    try {
+      const err = await res.json();
+      if (err.error) msg = err.error;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+export async function deleteFixture(id: string, name: string): Promise<void> {
+  const res = await fetch(
+    `/flybuild/api/${encodeURIComponent(id)}/fixtures/${encodeURIComponent(name)}`,
+    { method: "DELETE", headers: { "X-CSRF": CSRF } },
+  );
+  if (!res.ok) throw new Error(`delete fixture ${res.status}`);
+}
+
+// Build a same-origin fetch-then-data-URL for a fixture. We need a
+// data URL (not the raw URL) so it round-trips through the existing
+// `runtime_parameters.image: {type: base64, value}` path the engine
+// expects on /infer/workflows.
+export async function fixtureToDataUrl(
+  id: string,
+  name: string,
+): Promise<string> {
+  const res = await fetch(
+    `/flybuild/api/${encodeURIComponent(id)}/fixtures/${encodeURIComponent(name)}`,
+    { headers: { "X-CSRF": CSRF } },
+  );
+  if (!res.ok) throw new Error(`fixture ${res.status}`);
+  const blob = await res.blob();
+  return await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("read failed"));
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Import a `.flyttmpl.tar.gz` as a new workflow. Accepts both the
+// builder's slim variant and Studio's full bundle — the importer
+// extracts only `manifest.yaml`, `postprocess/workflow.json`, and
+// `fixtures/test_inputs/` (model weights / widget / alerts / card are
+// dropped, since the builder doesn't author those).
+export async function importBundle(
+  file: File,
+): Promise<{
+  id: string;
+  name: string;
+  version: number;
+  fixtures_count: number;
+  source: { root: string; schema_version: string; provenance: any };
+}> {
+  const fd = new FormData();
+  fd.append("file", file, file.name);
+  const res = await fetch(`/flybuild/api/import_bundle`, {
+    method: "POST",
+    headers: { "X-CSRF": CSRF },
+    body: fd,
+  });
+  if (!res.ok) {
+    let msg = `import ${res.status}`;
+    try {
+      const err = await res.json();
+      if (err.error) msg = err.error;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+// Fetch the .flyttmpl bundle for a workflow version and trigger a save
+// dialog in the browser. We pull as Blob (not <a href>) because the
+// download endpoint requires the X-CSRF header — anchor downloads can't
+// carry custom headers.
+export async function downloadBundle(
+  id: string,
+  version?: number,
+): Promise<{ filename: string; size: number }> {
+  const url = version != null
+    ? `/flybuild/api/${encodeURIComponent(id)}/bundle?version=${version}`
+    : `/flybuild/api/${encodeURIComponent(id)}/bundle`;
+  const res = await fetch(url, { headers: { "X-CSRF": CSRF } });
+  if (!res.ok) throw new Error(`bundle ${res.status}`);
+  // Pull filename out of Content-Disposition; fall back to a sensible
+  // default if the server omitted it.
+  const cd = res.headers.get("Content-Disposition") || "";
+  const m = cd.match(/filename="?([^";]+)"?/i);
+  const filename = m ? m[1] : `${id}.flyttmpl`;
+  const blob = await res.blob();
+  const objUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoke after the click handler has had a chance to start the
+  // download. 1s is comfortably more than any browser needs.
+  setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+  return { filename, size: blob.size };
+}
+
 // ---- Templates + devices + local models ----
 
 export type Template = {

@@ -327,6 +327,241 @@ export function validateRequiredFields(
   return issues;
 }
 
+// ---- Richer validator (drives the inline canvas indicators) -----------
+//
+// Reports per-step + workflow-level issues so FbNode can render a red
+// border / badge and FloatingInspector can list the specifics inline.
+//
+// Categories surfaced today:
+//   - missing required field (also covered by validateRequiredFields)
+//   - dangling $inputs.X reference (X not declared as a workflow input)
+//   - dangling $steps.X.Y reference (X not a step, or Y not an output of X)
+//
+// Not covered yet (could add):
+//   - kind-mismatched refs (image kind required, ref points at a string)
+//   - cyclic step references
+//   - duplicate step / output names
+
+export type IssueSeverity = "error" | "warning";
+
+export type StepIssue = {
+  step: string;
+  field?: string;
+  severity: IssueSeverity;
+  message: string;
+};
+
+export type WorkflowIssues = {
+  byStep: Record<string, StepIssue[]>;
+  workflow: StepIssue[];
+  total: number;
+};
+
+const REF_RE = /^\$(inputs|steps)\.([\w-]+)(?:\.([\w-]+))?$/;
+
+export function validateWorkflow(
+  spec: {
+    inputs?: Array<Record<string, unknown>>;
+    steps?: Array<Record<string, unknown>>;
+    outputs?: Array<Record<string, unknown>>;
+  },
+  blocks: BlockDef[],
+): WorkflowIssues {
+  const byStep: Record<string, StepIssue[]> = {};
+  const workflow: StepIssue[] = [];
+
+  const blocksById: Record<string, BlockDef> = {};
+  for (const b of blocks) blocksById[b.manifest_type_identifier] = b;
+
+  // Build lookup tables for ref resolution.
+  const inputNames = new Set<string>();
+  for (const inp of spec.inputs ?? []) {
+    const nm = (inp as any).name;
+    if (typeof nm === "string") inputNames.add(nm);
+  }
+
+  const stepsByName: Record<string, Record<string, unknown>> = {};
+  const stepBlockByName: Record<string, BlockDef | undefined> = {};
+  for (const step of spec.steps ?? []) {
+    const nm = String((step as any).name ?? "");
+    if (!nm) continue;
+    stepsByName[nm] = step;
+    stepBlockByName[nm] = blocksById[String((step as any).type ?? "")];
+  }
+
+  const outputNamesFor = (block?: BlockDef): Set<string> => {
+    const out = new Set<string>();
+    if (!block || !block.outputs_manifest) return out;
+    for (const o of block.outputs_manifest) {
+      if (o && typeof o.name === "string") out.add(o.name);
+    }
+    return out;
+  };
+
+  const push = (stepName: string, issue: StepIssue) => {
+    (byStep[stepName] ||= []).push(issue);
+  };
+
+  // Recursively scan a value for $inputs / $steps refs. `field` is the
+  // dotted path inside the step that led us here ("class_filter[0]",
+  // "predictions", etc.) — surfaced in the issue message so users know
+  // where to look.
+  const scanRefs = (
+    value: unknown,
+    field: string,
+    stepName: string,
+  ): void => {
+    if (typeof value === "string") {
+      if (!value.startsWith("$")) return;
+      const m = REF_RE.exec(value);
+      if (!m) {
+        // Some legitimate refs use $bundle.* or $constant.* — only
+        // flag $inputs / $steps shapes that don't parse.
+        if (value.startsWith("$inputs.") || value.startsWith("$steps.")) {
+          push(stepName, {
+            step: stepName,
+            field,
+            severity: "error",
+            message: `'${value}' is not a valid reference`,
+          });
+        }
+        return;
+      }
+      const [, kind, head, tail] = m;
+      if (kind === "inputs") {
+        if (!inputNames.has(head)) {
+          push(stepName, {
+            step: stepName,
+            field,
+            severity: "error",
+            message: `references unknown input '${head}'`,
+          });
+        }
+      } else if (kind === "steps") {
+        if (!(head in stepsByName)) {
+          push(stepName, {
+            step: stepName,
+            field,
+            severity: "error",
+            message: `references unknown step '${head}'`,
+          });
+          return;
+        }
+        if (tail) {
+          const outs = outputNamesFor(stepBlockByName[head]);
+          // Only flag when we actually have a manifest to compare
+          // against — empty/unknown manifests are common and we don't
+          // want false positives.
+          if (outs.size > 0 && !outs.has(tail)) {
+            push(stepName, {
+              step: stepName,
+              field,
+              severity: "error",
+              message: `'${head}' has no output '${tail}' (try: ${[...outs].slice(0, 3).join(", ")})`,
+            });
+          }
+        }
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((v, i) => scanRefs(v, `${field}[${i}]`, stepName));
+      return;
+    }
+    if (value && typeof value === "object") {
+      for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+        scanRefs(v, field ? `${field}.${k}` : k, stepName);
+      }
+    }
+  };
+
+  for (const step of spec.steps ?? []) {
+    const stepName = String((step as any).name ?? "");
+    if (!stepName) continue;
+    const stepType = String((step as any).type ?? "");
+    const def = blocksById[stepType];
+
+    // Required-field check — same logic as validateRequiredFields,
+    // emitted per-field so the inspector can highlight the right row.
+    const required: string[] = def?.block_schema?.required ?? [];
+    for (const r of required) {
+      if (r === "type" || r === "name") continue;
+      const v = (step as any)[r];
+      if (v === undefined || v === "" || v === null) {
+        push(stepName, {
+          step: stepName,
+          field: r,
+          severity: "error",
+          message: `required field '${r}' is empty`,
+        });
+      }
+    }
+
+    // Ref scan — every value in the step that's a string (or nested).
+    // Skip `type` / `name` since those are identifiers, not refs.
+    for (const [k, v] of Object.entries(step as Record<string, unknown>)) {
+      if (k === "type" || k === "name") continue;
+      scanRefs(v, k, stepName);
+    }
+  }
+
+  // Workflow-level issues. Cheap, drives the topbar banner.
+  if ((spec.steps?.length ?? 0) === 0 && (spec.inputs?.length ?? 0) === 0) {
+    workflow.push({
+      step: "(workflow)",
+      severity: "warning",
+      message: "Empty workflow — drop a block on the canvas to start",
+    });
+  }
+  if ((spec.outputs?.length ?? 0) === 0 && (spec.steps?.length ?? 0) > 0) {
+    workflow.push({
+      step: "(workflow)",
+      severity: "warning",
+      message:
+        "Workflow has no outputs declared — Run will succeed but return nothing",
+    });
+  }
+  // Output selectors must point at real steps/inputs too. Same scan,
+  // attributed to the workflow level rather than a step.
+  for (const out of spec.outputs ?? []) {
+    const sel = (out as any).selector;
+    const nm = (out as any).name ?? "(unnamed)";
+    if (typeof sel !== "string" || !sel.startsWith("$")) continue;
+    const m = REF_RE.exec(sel);
+    if (!m) continue;
+    const [, kind, head, tail] = m;
+    if (kind === "inputs" && !inputNames.has(head)) {
+      workflow.push({
+        step: "(workflow)",
+        severity: "error",
+        message: `output '${nm}' references unknown input '${head}'`,
+      });
+    } else if (kind === "steps") {
+      if (!(head in stepsByName)) {
+        workflow.push({
+          step: "(workflow)",
+          severity: "error",
+          message: `output '${nm}' references unknown step '${head}'`,
+        });
+      } else if (tail) {
+        const outs = outputNamesFor(stepBlockByName[head]);
+        if (outs.size > 0 && !outs.has(tail)) {
+          workflow.push({
+            step: "(workflow)",
+            severity: "error",
+            message: `output '${nm}' references missing output '${head}.${tail}'`,
+          });
+        }
+      }
+    }
+  }
+
+  let total = workflow.length;
+  for (const list of Object.values(byStep)) total += list.length;
+
+  return { byStep, workflow, total };
+}
+
 export type NodeKind = "step" | "input" | "output";
 
 export type FlytNodeData = {
@@ -350,6 +585,11 @@ export type FlytNodeData = {
   // output
   outputName?: string;
   outputSelector?: string;
+  // Inline-validation result for this node, computed by App.tsx via
+  // validateWorkflow on every spec change. Drives the red border + badge
+  // in FbNode and the Issues panel in FloatingInspector. Empty / absent
+  // when the node is valid.
+  issues?: StepIssue[];
 };
 
 export const PSEUDO_INPUT_IMAGE = "flyt/input_image";

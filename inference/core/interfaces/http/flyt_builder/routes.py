@@ -22,18 +22,33 @@ into ``<sha>/v1.json`` and writes a ``meta.json``. Migration is
 idempotent.
 """
 
+import datetime
 import glob
+import io
 import json
 import logging
 import os
 import re
 import shutil
+import tarfile
 import time
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, status
+import yaml
+
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
 from starlette.responses import (
     FileResponse,
     HTMLResponse,
@@ -125,6 +140,47 @@ def _meta_path(workflow_id: str) -> Path:
 
 def _version_path(workflow_id: str, version: int) -> Path:
     return _dir_for(workflow_id) / f"v{version}.json"
+
+
+# ---- Fixture storage ---------------------------------------------------
+#
+# Fixtures live alongside the workflow at ``<sha>/fixtures/<safename>``,
+# so deleting the workflow also deletes its fixtures (clean lifecycle).
+# Caps are deliberately small for v0 — users who need bigger libraries
+# should reach for Frame Storage (Studio's per-tenant object store)
+# instead. Total per-workflow ceiling = 5 × 10 MB = 50 MB.
+
+FIXTURES_DIR_NAME = "fixtures"
+FIXTURE_MAX_BYTES = 10 * 1024 * 1024
+FIXTURES_MAX_PER_WORKFLOW = 5
+# Allow letters/digits/dash/underscore/dot, require an extension of
+# 1-5 alphanumeric chars. Rejects path traversal and weird filenames.
+_FIXTURE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,80}\.[A-Za-z0-9]{1,5}$")
+
+
+def _fixtures_dir(workflow_id: str) -> Path:
+    return _dir_for(workflow_id) / FIXTURES_DIR_NAME
+
+
+def _sanitize_fixture_name(raw: str) -> Optional[str]:
+    """Trim directory parts, normalise, accept only safe names.
+
+    Returns the cleaned name, or None if it can't be made safe. We
+    reject rather than silently rewriting so the user knows something
+    happened (e.g. uploading "../../etc/passwd").
+    """
+    if not raw:
+        return None
+    # Strip any directory components (Windows + posix).
+    raw = raw.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    # Map spaces and stray characters to underscore so a typical
+    # "drone view 1.jpg" upload doesn't get rejected outright.
+    cleaned = re.sub(r"[^A-Za-z0-9_.\-]", "_", raw)
+    if cleaned.startswith("."):
+        cleaned = cleaned.lstrip(".")
+    if not _FIXTURE_NAME_RE.match(cleaned):
+        return None
+    return cleaned
 
 
 def _migrate_if_flat(workflow_id: str) -> bool:
@@ -389,6 +445,231 @@ async def list_local_models():
     return JSONResponse({"data": out}, status_code=200)
 
 
+# ---- Bundle import (.flyttmpl.tar.gz → new workflow) -------------------
+#
+# Reverse direction of the bundle endpoint. Accepts both flavours of
+# bundle (builder slim AND Studio full); ignores the heavy parts of
+# Studio bundles (model/, widget/, alerts/, card/, fixtures/expected_outputs/)
+# since the builder doesn't author those — we only need the workflow
+# spec + test fixtures.
+
+IMPORT_MAX_BYTES = 200 * 1024 * 1024  # 200 MB — generous, covers Studio full bundles
+IMPORT_SUPPORTED_SCHEMA_VERSIONS = {"0.1"}
+# Per-fixture cap mirrors the upload-fixture endpoint so a hostile
+# bundle can't smuggle a 5 GB image through the import path.
+IMPORT_MAX_FIXTURES = 20  # higher than the upload cap so users can import a Studio bundle with several test inputs
+
+
+def _disambiguate_id(desired: str) -> str:
+    """Append `_imported_<N>` until a free workflow id is found.
+
+    First call gets `<desired>` if free, else `<desired>_imported`,
+    `<desired>_imported_2`, `<desired>_imported_3`, ... — capped at 50
+    to bound the linear scan.
+    """
+    if not _dir_for(desired).exists() and not _legacy_flat_path(desired).exists():
+        return desired
+    base = f"{desired}_imported"
+    for n in range(1, 51):
+        candidate = base if n == 1 else f"{base}_{n}"
+        if not _dir_for(candidate).exists() and not _legacy_flat_path(candidate).exists():
+            return candidate
+    raise HTTPException(
+        status_code=409,
+        detail="too many existing imports of this id; rename and retry",
+    )
+
+
+@router.post("/api/import_bundle", dependencies=[Depends(verify_csrf_token)])
+@with_route_exceptions_async
+async def import_bundle(file: UploadFile = File(...)):
+    """Import a `.flyttmpl.tar.gz` as a new workflow.
+
+    The builder doesn't carry model weights or Studio-only sections —
+    those are dropped during import. Only `manifest.yaml`,
+    `postprocess/workflow.json`, and `fixtures/test_inputs/*` survive
+    into builder storage.
+    """
+    payload = await file.read(IMPORT_MAX_BYTES + 1)
+    if len(payload) > IMPORT_MAX_BYTES:
+        return JSONResponse(
+            {
+                "error": (
+                    f"bundle exceeds {IMPORT_MAX_BYTES // (1024 * 1024)} MB import cap"
+                )
+            },
+            status_code=413,
+        )
+    if not payload:
+        return JSONResponse(
+            {"error": "empty upload"}, status_code=HTTP_400_BAD_REQUEST
+        )
+
+    try:
+        tar = tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz")
+    except (tarfile.ReadError, EOFError) as e:
+        return JSONResponse(
+            {"error": f"not a valid .flyttmpl.tar.gz: {e}"},
+            status_code=HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        # Find the bundle root — same logic as Studio's verifier:
+        # the unique top-level directory member.
+        members = tar.getmembers()
+        roots = [m for m in members if "/" not in m.name.rstrip("/") and m.isdir()]
+        if not roots:
+            # Some tarballs lack explicit DIRTYPE entries; fall back
+            # to inferring from the first path component.
+            seen: set = set()
+            for m in members:
+                head = m.name.split("/", 1)[0]
+                if head:
+                    seen.add(head)
+            if len(seen) != 1:
+                return JSONResponse(
+                    {"error": "tarball does not contain a single top-level dir"},
+                    status_code=HTTP_400_BAD_REQUEST,
+                )
+            root_name = next(iter(seen))
+        else:
+            root_name = roots[0].name.rstrip("/")
+
+        # Read manifest.yaml. Required.
+        manifest_path = f"{root_name}/manifest.yaml"
+        manifest_member = next(
+            (m for m in members if m.name == manifest_path), None
+        )
+        if manifest_member is None:
+            return JSONResponse(
+                {"error": "missing manifest.yaml"},
+                status_code=HTTP_400_BAD_REQUEST,
+            )
+        manifest_bytes = tar.extractfile(manifest_member).read()
+        try:
+            manifest = yaml.safe_load(manifest_bytes)
+        except yaml.YAMLError as e:
+            return JSONResponse(
+                {"error": f"manifest.yaml not valid YAML: {e}"},
+                status_code=HTTP_400_BAD_REQUEST,
+            )
+        if not isinstance(manifest, dict):
+            return JSONResponse(
+                {"error": "manifest.yaml is not a mapping"},
+                status_code=HTTP_400_BAD_REQUEST,
+            )
+
+        sv = manifest.get("schema_version")
+        if sv not in IMPORT_SUPPORTED_SCHEMA_VERSIONS:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"unsupported schema_version '{sv}'; "
+                        f"supported: {sorted(IMPORT_SUPPORTED_SCHEMA_VERSIONS)}"
+                    )
+                },
+                status_code=HTTP_400_BAD_REQUEST,
+            )
+
+        # Read workflow.json. Required.
+        workflow_path = f"{root_name}/postprocess/workflow.json"
+        workflow_member = next(
+            (m for m in members if m.name == workflow_path), None
+        )
+        if workflow_member is None:
+            return JSONResponse(
+                {"error": "missing postprocess/workflow.json"},
+                status_code=HTTP_400_BAD_REQUEST,
+            )
+        try:
+            workflow_spec = json.loads(
+                tar.extractfile(workflow_member).read().decode("utf-8")
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return JSONResponse(
+                {"error": f"workflow.json not valid JSON: {e}"},
+                status_code=HTTP_400_BAD_REQUEST,
+            )
+
+        # Optional: collect fixtures from fixtures/test_inputs/. Sized
+        # individually against the upload-fixture cap; total count
+        # against IMPORT_MAX_FIXTURES.
+        fixture_prefix = f"{root_name}/fixtures/test_inputs/"
+        fixture_payloads: List[Tuple[str, bytes]] = []
+        for m in members:
+            if not m.isfile():
+                continue
+            if not m.name.startswith(fixture_prefix):
+                continue
+            rel = m.name[len(fixture_prefix):]
+            if not rel or "/" in rel:
+                # Subdirectories under test_inputs/ are unexpected; skip.
+                continue
+            safe = _sanitize_fixture_name(rel)
+            if safe is None:
+                logger.warning(f"flyt import: skipping unsafe fixture name {rel}")
+                continue
+            if m.size > FIXTURE_MAX_BYTES:
+                logger.warning(
+                    f"flyt import: skipping {rel} — exceeds {FIXTURE_MAX_BYTES} bytes"
+                )
+                continue
+            if len(fixture_payloads) >= IMPORT_MAX_FIXTURES:
+                break
+            fx_bytes = tar.extractfile(m).read()
+            fixture_payloads.append((safe, fx_bytes))
+    finally:
+        tar.close()
+
+    # Pick a workflow id. Prefer the original; disambiguate if it
+    # collides with an existing workflow on this builder.
+    template = manifest.get("template") or {}
+    desired_raw = (
+        template.get("workflow_id") or template.get("name") or "imported"
+    )
+    desired = re.sub(r"[^A-Za-z0-9_-]", "-", str(desired_raw))[:64].strip("-_")
+    if not desired:
+        desired = "imported"
+    new_id = _disambiguate_id(desired)
+
+    # Persist as v1 of a brand-new workflow.
+    payload_to_save = {
+        "id": new_id,
+        "name": template.get("name") or new_id,
+        "description": (
+            template.get("description")
+            or f"Imported from {root_name}.flyttmpl"
+        ),
+        "specification": workflow_spec,
+    }
+    _write_version(new_id, 1, payload_to_save)
+    _write_meta(
+        new_id, {"id": new_id, "current_version": 1, "versions": [1]}
+    )
+
+    # Land fixtures in the new workflow's fixture dir.
+    if fixture_payloads:
+        fdir = _fixtures_dir(new_id)
+        fdir.mkdir(parents=True, exist_ok=True)
+        for safe_name, data in fixture_payloads:
+            (fdir / safe_name).write_bytes(data)
+
+    return JSONResponse(
+        {
+            "id": new_id,
+            "name": payload_to_save["name"],
+            "version": 1,
+            "fixtures_count": len(fixture_payloads),
+            "source": {
+                "root": root_name,
+                "schema_version": sv,
+                "provenance": manifest.get("provenance") or {},
+            },
+        },
+        status_code=HTTP_201_CREATED,
+    )
+
+
 @router.get("/api/{workflow_id}", dependencies=[Depends(verify_csrf_token)])
 @with_route_exceptions_async
 async def get_workflow(workflow_id: str, version: Optional[int] = Query(None)):
@@ -555,6 +836,536 @@ async def publish_workflow(workflow_id: str, request_body: Optional[dict] = Body
         {"message": f"Published v{next_version}", "version": next_version},
         status_code=HTTP_201_CREATED,
     )
+
+
+# ---- .flyttmpl bundle (schema_version "0.1", builder slim variant) -----
+#
+# Aligned with Studio Phase A's bundle shape (see
+# `flytbase/docs/11_flyttmpl_alignment.md`). The builder produces the
+# SAME manifest shape Studio does — just with fewer fields populated:
+#
+#   * `template`     — yes (name, version, kind=workflow, description, created_at)
+#   * `model`        — OMITTED (builder ships no weights; Studio adds at enrichment)
+#   * `hardware`     — OMITTED (workflows are device-agnostic until deployed)
+#   * `license`      — OMITTED (Studio resolves per-model_id licenses at enrichment)
+#   * `provenance`   — yes (source_path=flow_builder, workflow_fingerprint, model_ids)
+#   * `signer`       — yes (scheme=unsigned-prototype — same field name Studio uses)
+#   * `files`        — yes (per-file sha256 + size_bytes inventory)
+#
+# Bundle flavor is conveyed by `provenance.source_path: flow_builder`,
+# distinguishing builder-emitted slim bundles from Studio-emitted full
+# bundles (`train_new`, `byom`, `partner_full`). Studio's enricher reads
+# the source_path, fills the omitted fields, and rewrites
+# `model_id: "yolov8n-640"` → `bundle://model/weights.onnx`.
+
+
+def _collect_model_ids(spec: Any) -> List[str]:
+    """Walk a workflow spec and return all literal model_id references.
+
+    Skips dynamic references like ``$inputs.foo`` so the bundle manifest
+    only lists weights the runtime must actually have cached. Stable
+    sort + dedupe so two builds of the same spec yield byte-identical
+    manifests (important for fingerprinting).
+    """
+    found: set = set()
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if (
+                    k == "model_id"
+                    and isinstance(v, str)
+                    and v
+                    and not v.startswith("$")
+                ):
+                    found.add(v)
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(spec)
+    return sorted(found)
+
+
+def _sha256_hex(data: bytes) -> str:
+    return sha256(data).hexdigest()
+
+
+def _collect_fixture_payloads(workflow_id: str) -> List[Tuple[str, bytes]]:
+    """Read every fixture for a workflow into memory for bundling.
+
+    Returns list of (zip_path, bytes) pairs. zip_path is the bundle-
+    relative path (`fixtures/test_inputs/<name>`). Empty list if the
+    workflow has no fixtures or the directory doesn't exist.
+    """
+    fdir = _fixtures_dir(workflow_id)
+    out: List[Tuple[str, bytes]] = []
+    if not fdir.exists():
+        return out
+    for p in sorted(fdir.iterdir()):
+        if not p.is_file():
+            continue
+        try:
+            out.append((f"fixtures/test_inputs/{p.name}", p.read_bytes()))
+        except OSError as e:
+            logger.warning(f"flyt bundle: skipping fixture {p}: {e}")
+    return out
+
+
+def _build_flyttmpl_bytes(
+    workflow_id: str, version: int, payload: dict, meta: dict
+) -> bytes:
+    """Assemble a .flyttmpl zip in memory and return its bytes.
+
+    Manifest shape mirrors AI-R Studio Phase A's `manifest.yaml` (see
+    `flytbase/docs/11_flyttmpl_alignment.md`). The builder populates a
+    subset; Studio's enricher fills the omitted sections later.
+    """
+    spec = payload.get("specification") or {}
+    model_ids = _collect_model_ids(spec)
+    name = payload.get("name") or workflow_id
+    description = payload.get("description", "")
+
+    # Stable hash of the workflow spec only. Re-publishing the same
+    # spec produces the same fingerprint regardless of bundle_version,
+    # so deployment caches can dedupe.
+    spec_canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"))
+    workflow_fingerprint = sha256(spec_canonical.encode("utf-8")).hexdigest()
+
+    # ---- Build the file payloads first so we can fill files[] before
+    # we write the manifest. The manifest itself is NOT in files[] (no
+    # circularity), matching Studio's convention.
+    workflow_bytes = json.dumps(spec, indent=2, sort_keys=True).encode("utf-8")
+    workflow_path = "postprocess/workflow.json"
+
+    fixture_payloads = _collect_fixture_payloads(workflow_id)
+    fixture_count = len(fixture_payloads)
+
+    readme_bytes = _render_readme(
+        name=name,
+        description=description,
+        bundle_version=version,
+        workflow_fingerprint=workflow_fingerprint,
+        model_ids=model_ids,
+        fixture_count=fixture_count,
+    ).encode("utf-8")
+    readme_path = "README.md"
+
+    file_payloads: List[Tuple[str, bytes]] = [
+        (workflow_path, workflow_bytes),
+        (readme_path, readme_bytes),
+        *fixture_payloads,
+    ]
+    files_inventory = sorted(
+        (
+            {
+                "path": zp,
+                "sha256": _sha256_hex(b),
+                "size_bytes": len(b),
+            }
+            for zp, b in file_payloads
+        ),
+        key=lambda x: x["path"],
+    )
+
+    # ---- Manifest ------------------------------------------------------
+    # Field shape matches Studio Phase A's manifest.yaml — same keys
+    # under template / provenance / signer / files. Sections Studio's
+    # enricher fills (model, hardware, license) are simply omitted here
+    # rather than emitted as `null` so a YAML reader doesn't have to
+    # distinguish "Studio didn't write" from "field was empty".
+    created_at_iso = (
+        datetime.datetime.utcnow()
+        .replace(microsecond=0, tzinfo=datetime.timezone.utc)
+        .isoformat()
+    )
+    manifest: Dict[str, Any] = {
+        "schema_version": "0.1",
+        "template": {
+            "name": name,
+            # 0.<bundle_version>.0 anchors template version to the
+            # builder's publish counter. Studio enricher may rewrite
+            # this when it stamps a customer-facing semver.
+            "version": f"0.{int(version)}.0",
+            "kind": "workflow",
+            "description": description
+            or "Authored in the FlytBase flow builder.",
+            "created_at": created_at_iso,
+            "workflow_id": workflow_id,
+        },
+        "provenance": {
+            "source_path": "flow_builder",
+            "studio_phase": "builder-edge",
+            "workflow_fingerprint": workflow_fingerprint,
+            "bundle_version": int(version),
+            "model_ids": model_ids,
+            "fixtures_count": fixture_count,
+        },
+        "signer": {
+            "scheme": "unsigned-prototype",
+            "key_id": None,
+            "signature": None,
+            "note": (
+                "Builder-edge bundle — re-signed by Studio enricher or "
+                "Bundle Signing Service before deployment"
+            ),
+        },
+        "files": files_inventory,
+    }
+
+    # ---- Tarball everything -------------------------------------------
+    # Studio Phase A's `verify_bundle.py` reads `.flyttmpl.tar.gz` with
+    # a top-level directory inside. We match that container exactly so
+    # the same verifier works on both Studio-emitted and builder-emitted
+    # bundles.
+    template_name = (manifest["template"]["name"] or workflow_id).replace(" ", "_")
+    template_version = manifest["template"]["version"]
+    bundle_root = f"{template_name}_v{template_version}.flyttmpl"
+
+    manifest_yaml = yaml.safe_dump(
+        manifest, sort_keys=False, default_flow_style=False
+    ).encode("utf-8")
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        # Top-level bundle dir as an explicit DIRTYPE entry — Studio's
+        # `verify_bundle.py` finds the bundle root by looking for a
+        # member with no `/` in its name. Without this, the verifier
+        # can't locate the manifest.
+        _add_tar_dir(tar, bundle_root)
+        # Manifest first inside the root (streaming readers find it
+        # without walking the whole tarball).
+        _add_tar_file(tar, f"{bundle_root}/manifest.yaml", manifest_yaml)
+        # Track subdirs we've added so we emit a DIRTYPE entry for
+        # `fixtures/`, `postprocess/`, `fixtures/test_inputs/`, etc.
+        # exactly once, in path order.
+        seen_dirs: set = set()
+        for zp, b in file_payloads:
+            parent = "/".join(zp.split("/")[:-1])
+            if parent and parent not in seen_dirs:
+                # Walk parent prefixes so a deep path like
+                # `fixtures/test_inputs/foo.jpg` emits both
+                # `fixtures/` and `fixtures/test_inputs/`.
+                segs = parent.split("/")
+                for i in range(1, len(segs) + 1):
+                    sub = "/".join(segs[:i])
+                    if sub not in seen_dirs:
+                        _add_tar_dir(tar, f"{bundle_root}/{sub}")
+                        seen_dirs.add(sub)
+            _add_tar_file(tar, f"{bundle_root}/{zp}", b)
+    return buf.getvalue()
+
+
+def _add_tar_file(tar: tarfile.TarFile, name: str, data: bytes) -> None:
+    info = tarfile.TarInfo(name=name)
+    info.size = len(data)
+    info.mtime = int(time.time())
+    info.mode = 0o644
+    tar.addfile(info, io.BytesIO(data))
+
+
+def _add_tar_dir(tar: tarfile.TarFile, name: str) -> None:
+    info = tarfile.TarInfo(name=name)
+    info.type = tarfile.DIRTYPE
+    info.size = 0
+    info.mtime = int(time.time())
+    info.mode = 0o755
+    tar.addfile(info)
+
+
+def _render_readme(
+    *,
+    name: str,
+    description: str,
+    bundle_version: int,
+    workflow_fingerprint: str,
+    model_ids: List[str],
+    fixture_count: int,
+) -> str:
+    lines = [
+        f"# {name}",
+        "",
+        f"Bundle version: v{bundle_version}",
+        "Schema: `0.1` (flow-builder slim variant)",
+        f"Fingerprint: `{workflow_fingerprint[:16]}…`",
+        f"Created: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}",
+        "",
+    ]
+    if description:
+        lines += [description, ""]
+    lines += ["## Model IDs referenced", ""]
+    if model_ids:
+        lines += [f"- `{m}`" for m in model_ids]
+    else:
+        lines += ["_(none — workflow uses no model_id-keyed blocks)_"]
+    lines += [
+        "",
+        "## Scope of this bundle",
+        "",
+        "Authored in the FlytBase flow builder. Contains the workflow",
+        "specification, saved fixtures, and metadata. Model weights,",
+        "dashboard widgets, alert rules, and performance cards are added",
+        "by AI-R Studio / Model Hub during enrichment, not authored here.",
+        "",
+        "## Layout",
+        "",
+        "- `manifest.yaml` — bundle metadata (Studio Phase A shape)",
+        "- `postprocess/workflow.json` — workflow specification (Roboflow Workflow JSON)",
+        f"- `fixtures/test_inputs/` — {fixture_count} saved fixture(s)"
+        if fixture_count
+        else "- `fixtures/` — _(no fixtures saved for this workflow)_",
+        "- `README.md` — this file",
+        "",
+        "## What runs this",
+        "",
+        "An AI-R Edge runtime with the listed model IDs already cached",
+        "in `$MODEL_CACHE_DIR`, or a Model Hub registration that resolves",
+        "them. Studio's `run_workflow.py` accepts these bundles once a",
+        "model_id fall-through is wired (see",
+        "`flytbase/docs/11_flyttmpl_alignment.md`).",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+@router.get("/api/{workflow_id}/bundle", dependencies=[Depends(verify_csrf_token)])
+@with_route_exceptions_async
+async def download_bundle(
+    workflow_id: str, version: Optional[int] = Query(None)
+):
+    """Return a `.flyttmpl` zip for the requested (or current) version.
+
+    The CSRF guard means browsers can only invoke this via fetch() with
+    the x-csrf header — direct anchor downloads will 403. The frontend
+    calls fetch then saves the Blob to a download anchor, which is the
+    same pattern used everywhere else in the SPA.
+    """
+    err = _validate_id(workflow_id)
+    if err:
+        return err
+    _migrate_if_flat(workflow_id)
+    meta = _read_meta(workflow_id)
+    if not meta:
+        return JSONResponse(
+            {"error": "not found"}, status_code=HTTP_404_NOT_FOUND
+        )
+    versions = list(meta.get("versions", []))
+    v = int(version) if version is not None else int(meta.get("current_version", 1))
+    if v not in versions:
+        return JSONResponse(
+            {"error": f"version {v} not found"},
+            status_code=HTTP_404_NOT_FOUND,
+        )
+    payload = _read_version(workflow_id, v)
+    if payload is None:
+        return JSONResponse(
+            {"error": "version data missing on disk"},
+            status_code=HTTP_404_NOT_FOUND,
+        )
+
+    data = _build_flyttmpl_bytes(workflow_id, v, payload, meta)
+    # Match Studio Phase A's filename pattern: <name>_v<semver>.flyttmpl.tar.gz.
+    # template.version is set to "0.<bundle_version>.0" inside
+    # _build_flyttmpl_bytes; reuse the same string here.
+    safe_name = (payload.get("name") or workflow_id).replace(" ", "_")
+    filename = f"{safe_name}_v0.{v}.0.flyttmpl.tar.gz"
+    return Response(
+        content=data,
+        media_type="application/gzip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # Bundle bytes are cheap to regenerate; never cache so a
+            # fresh Publish always serves fresh content.
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+# ---- Fixtures (per-workflow scene image library) -----------------------
+
+
+@router.get("/api/{workflow_id}/fixtures", dependencies=[Depends(verify_csrf_token)])
+@with_route_exceptions_async
+async def list_fixtures(workflow_id: str):
+    err = _validate_id(workflow_id)
+    if err:
+        return err
+    fdir = _fixtures_dir(workflow_id)
+    out: List[dict] = []
+    if fdir.exists():
+        for p in sorted(fdir.iterdir()):
+            if not p.is_file():
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            out.append(
+                {
+                    "name": p.name,
+                    "size": st.st_size,
+                    "mtime": int(st.st_mtime),
+                }
+            )
+    return JSONResponse(
+        {
+            "data": out,
+            "limits": {
+                "max_per_workflow": FIXTURES_MAX_PER_WORKFLOW,
+                "max_bytes_per_file": FIXTURE_MAX_BYTES,
+            },
+        },
+        status_code=200,
+    )
+
+
+@router.post(
+    "/api/{workflow_id}/fixtures", dependencies=[Depends(verify_csrf_token)]
+)
+@with_route_exceptions_async
+async def upload_fixture(
+    workflow_id: str, file: UploadFile = File(...)
+):
+    """Save an uploaded image as a fixture for this workflow.
+
+    Caps:
+      - 10 MB per file (we read up to cap+1 and reject if larger).
+      - 5 fixtures per workflow (re-uploading an existing name is OK
+        — same name is treated as a replace, not a new fixture).
+
+    Filename is sanitised; uploads with unsafe names are rejected
+    rather than silently rewritten, so the operator notices.
+    """
+    err = _validate_id(workflow_id)
+    if err:
+        return err
+    # Workflows are created lazily on first save, so the dir may not
+    # exist yet for a brand-new workflow. Fixtures require an existing
+    # workflow so we don't accumulate orphans.
+    if not _dir_for(workflow_id).exists():
+        return JSONResponse(
+            {"error": "save the workflow first, then upload fixtures"},
+            status_code=HTTP_400_BAD_REQUEST,
+        )
+    safe = _sanitize_fixture_name(file.filename or "")
+    if safe is None:
+        return JSONResponse(
+            {
+                "error": "invalid filename",
+                "hint": "use letters/digits/_.-, plus a 1-5 char extension (e.g. drone_view_01.jpg)",
+            },
+            status_code=HTTP_400_BAD_REQUEST,
+        )
+
+    # Read with a hard cap. Reading cap+1 lets us distinguish
+    # "exactly cap" (allowed) from "over cap" (rejected) without
+    # buffering the whole oversize payload.
+    payload = await file.read(FIXTURE_MAX_BYTES + 1)
+    if len(payload) > FIXTURE_MAX_BYTES:
+        return JSONResponse(
+            {
+                "error": (
+                    f"file exceeds {FIXTURE_MAX_BYTES // (1024 * 1024)} MB cap; "
+                    "use Frame Storage for larger images"
+                )
+            },
+            status_code=413,
+        )
+    if not payload:
+        return JSONResponse(
+            {"error": "empty file"}, status_code=HTTP_400_BAD_REQUEST
+        )
+
+    fdir = _fixtures_dir(workflow_id)
+    fdir.mkdir(parents=True, exist_ok=True)
+    target = fdir / safe
+    is_replace = target.exists()
+    if not is_replace:
+        # Count cap only for net-new uploads — replacing an existing
+        # fixture by name shouldn't be blocked at the limit.
+        existing = [p for p in fdir.iterdir() if p.is_file()]
+        if len(existing) >= FIXTURES_MAX_PER_WORKFLOW:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"workflow at fixture cap ({FIXTURES_MAX_PER_WORKFLOW}); "
+                        "delete an existing fixture first"
+                    )
+                },
+                status_code=409,
+            )
+
+    target.write_bytes(payload)
+    return JSONResponse(
+        {
+            "name": safe,
+            "size": len(payload),
+            "replaced": is_replace,
+        },
+        status_code=HTTP_201_CREATED,
+    )
+
+
+@router.get(
+    "/api/{workflow_id}/fixtures/{name}",
+    dependencies=[Depends(verify_csrf_token)],
+)
+@with_route_exceptions_async
+async def get_fixture(workflow_id: str, name: str):
+    err = _validate_id(workflow_id)
+    if err:
+        return err
+    safe = _sanitize_fixture_name(name)
+    if safe is None or safe != name:
+        # Reject any name that doesn't pass our regex AND any name we
+        # had to rewrite — both indicate the caller is doing something
+        # unexpected (path traversal, percent-encoded surprises).
+        return JSONResponse(
+            {"error": "invalid fixture name"},
+            status_code=HTTP_400_BAD_REQUEST,
+        )
+    target = _fixtures_dir(workflow_id) / safe
+    if not target.exists() or not target.is_file():
+        return JSONResponse(
+            {"error": "fixture not found"}, status_code=HTTP_404_NOT_FOUND
+        )
+    return FileResponse(
+        target,
+        # FileResponse infers media_type from the suffix; we rely on
+        # that so .jpg → image/jpeg, .png → image/png, .mp4 → video/mp4.
+    )
+
+
+@router.delete(
+    "/api/{workflow_id}/fixtures/{name}",
+    dependencies=[Depends(verify_csrf_token)],
+)
+@with_route_exceptions_async
+async def delete_fixture(workflow_id: str, name: str):
+    err = _validate_id(workflow_id)
+    if err:
+        return err
+    safe = _sanitize_fixture_name(name)
+    if safe is None or safe != name:
+        return JSONResponse(
+            {"error": "invalid fixture name"},
+            status_code=HTTP_400_BAD_REQUEST,
+        )
+    target = _fixtures_dir(workflow_id) / safe
+    if not target.exists():
+        return JSONResponse(
+            {"error": "fixture not found"}, status_code=HTTP_404_NOT_FOUND
+        )
+    try:
+        target.unlink()
+    except OSError as e:
+        return JSONResponse(
+            {"error": f"could not delete: {e}"},
+            status_code=500,
+        )
+    return JSONResponse({"deleted": safe}, status_code=200)
 
 
 @router.get("/api/{workflow_id}/versions", dependencies=[Depends(verify_csrf_token)])

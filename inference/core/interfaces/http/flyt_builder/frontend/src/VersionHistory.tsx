@@ -3,7 +3,7 @@
 // restoring copies the chosen v<N> forward as a new current_version.
 
 import { useCallback, useEffect, useState } from "react";
-import { listVersions, restoreVersion } from "./api";
+import { downloadBundle, listVersions, restoreVersion } from "./api";
 
 type VersionRow = {
   version: number;
@@ -70,6 +70,17 @@ export function VersionHistory({
     [workflowId, refresh, onRestored],
   );
 
+  const onDownload = useCallback(
+    async (v: number) => {
+      try {
+        await downloadBundle(workflowId, v);
+      } catch (e: any) {
+        alert(`Download failed: ${e?.message || e}`);
+      }
+    },
+    [workflowId],
+  );
+
   return (
     <div className="version-drawer">
       <div className="header">
@@ -96,15 +107,25 @@ export function VersionHistory({
               <div className="when">edited {formatAgo(r.updateTime)}</div>
               {r.is_current && <div className="pill">current</div>}
             </div>
-            {!r.is_current && (
+            <div className="actions">
               <button
-                className="btn"
-                onClick={() => onRestore(r.version)}
-                title={`Restore v${r.version} as v${(current || 0) + 1}`}
+                className="icon-btn"
+                onClick={() => onDownload(r.version)}
+                title={`Download v${r.version} as a .flyttmpl bundle`}
+                aria-label={`Download v${r.version}`}
               >
-                Restore
+                ⬇
               </button>
-            )}
+              {!r.is_current && (
+                <button
+                  className="btn"
+                  onClick={() => onRestore(r.version)}
+                  title={`Restore v${r.version} as v${(current || 0) + 1}`}
+                >
+                  Restore
+                </button>
+              )}
+            </div>
           </div>
         ))}
       </div>

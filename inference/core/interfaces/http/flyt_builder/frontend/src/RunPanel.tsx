@@ -9,15 +9,31 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BlockDef,
   ConsumeTimeoutError,
+  Fixture,
   PipelineGoneError,
   consumePipeline,
+  deleteFixture,
+  fixtureToDataUrl,
   initPipeline,
   listDevices,
+  listFixtures,
   runWorkflow,
   terminatePipeline,
+  uploadFixture,
 } from "./api";
 import { validateRequiredFields } from "./compile";
 import { startWebRTCStream, WebRTCHandle } from "./WebRTCStream";
+import {
+  ClassificationBlock,
+  DetectionBlock,
+  collectPredictions,
+} from "./predictions";
+import {
+  ClassificationBadge,
+  DEFAULT_LAYERS,
+  DetectionOverlay,
+  Layers,
+} from "./DetectionOverlay";
 
 // ---- Types --------------------------------------------------------------
 
@@ -36,6 +52,7 @@ export type InputDef = {
 };
 
 type Props = {
+  workflowId: string;
   workflowSpec: any;
   inputs: InputDef[];
   blocks: BlockDef[];
@@ -66,20 +83,49 @@ function computeFps(timestamps: number[]): number | null {
 }
 
 // Rank image outputs and pick the "hero" — the one worth showing big.
-// Names like `mask_visualization_output` or `bbox_viz.image` are
-// overlays worth putting front and center. Fall back to the first.
+// We now draw bboxes/masks/keypoints client-side via SVG overlay, so
+// raw images are preferred over server-side visualizations: drawing on
+// a raw frame gives a single clean rendering instead of doubling up on
+// bboxes a viz block already painted in. Fall back to the first.
 function pickHeroImage<T extends { path: string }>(images: T[]): T | null {
   if (!images.length) return null;
   const byScore = (img: T) => {
     const p = img.path.toLowerCase();
     let s = 0;
-    if (/visualization|viz|overlay|annotat|trace|bbox|mask/.test(p)) s -= 100;
+    // Penalise pre-annotated images so the client overlay has a clean
+    // canvas. (Old behaviour was to *prefer* these, back when the panel
+    // could only display whatever the workflow rendered server-side.)
+    if (/visualization|viz|overlay|annotat|trace|bbox|mask/.test(p)) s += 100;
     if (p === "image" || p.endsWith(".image")) s -= 20;
     // Prefer shallower paths (closer to top-level "outputs[*].foo").
     s += p.split(".").length;
     return s;
   };
   return [...images].sort((a, b) => byScore(a) - byScore(b))[0];
+}
+
+// Pair an image path with the detection block that lives next to it in
+// the payload. Exact match on the recorded `imagePath` wins (set when
+// the canonical {image, predictions} pair was found at the same node).
+// Falls back to the only-block case when image dims weren't shipped.
+function pairDetectionsToImage(
+  imagePath: string,
+  blocks: DetectionBlock[],
+): DetectionBlock | null {
+  if (!blocks.length) return null;
+  const exact = blocks.find((b) => b.imagePath && b.imagePath === imagePath);
+  if (exact) return exact;
+  // Sibling: image at `<scope>.image`, detections at `<scope>.predictions`.
+  const imgParent = imagePath.replace(/\.[^.]+$/, "");
+  if (imgParent && imgParent !== imagePath) {
+    const sibling = blocks.find(
+      (b) => b.path === `${imgParent}.predictions` || b.path.startsWith(`${imgParent}.`),
+    );
+    if (sibling) return sibling;
+  }
+  // Last-ditch: when there's exactly one block in the payload, draw it
+  // on whatever image we got (typical for a single-input workflow).
+  return blocks.length === 1 ? blocks[0] : null;
 }
 
 // ---- Helpers ------------------------------------------------------------
@@ -137,12 +183,22 @@ function InputCard({
   onChange,
   devices,
   webcamDevices,
+  workflowId,
+  fixtures,
+  fixturesLimit,
+  onFixtureUpload,
+  onFixtureDelete,
 }: {
   input: InputDef;
   source: InputSource | null;
   onChange: (s: InputSource) => void;
   devices: Array<{ path: string; label: string }>;
   webcamDevices: Array<{ deviceId: string; label: string }>;
+  workflowId: string;
+  fixtures: Fixture[];
+  fixturesLimit: number;
+  onFixtureUpload: (file: File) => Promise<void>;
+  onFixtureDelete: (name: string) => Promise<void>;
 }) {
   if (input.type === "WorkflowParameter") {
     const v = source && source.kind === "param" ? source.value : (input.defaultValue ?? "");
@@ -235,6 +291,89 @@ function InputCard({
             {source?.kind === "file" && source.filename && (
               <div className="hint">
                 {source.filename} · {source.mime}
+                <button
+                  type="button"
+                  className="save-fixture"
+                  title={`Save this file as a fixture for workflow "${workflowId}"`}
+                  onClick={async () => {
+                    if (!source.dataUrl || !source.filename) return;
+                    try {
+                      const r = await fetch(source.dataUrl);
+                      const blob = await r.blob();
+                      const file = new File([blob], source.filename, {
+                        type: source.mime || blob.type || "application/octet-stream",
+                      });
+                      await onFixtureUpload(file);
+                    } catch (e: any) {
+                      alert(`Save fixture failed: ${e?.message || e}`);
+                    }
+                  }}
+                >
+                  + Save as fixture
+                </button>
+              </div>
+            )}
+            {fixtures.length > 0 && (
+              <div className="fixture-strip">
+                <div className="label">
+                  Fixtures ({fixtures.length}/{fixturesLimit})
+                </div>
+                <div className="chips">
+                  {fixtures.map((fx) => {
+                    const active =
+                      source?.kind === "file" && source.filename === fx.name;
+                    return (
+                      <span
+                        key={fx.name}
+                        className={`fixture-chip ${active ? "active" : ""}`}
+                      >
+                        <button
+                          type="button"
+                          className="pick"
+                          title={`Load ${fx.name} (${Math.round(fx.size / 1024)} KB)`}
+                          onClick={async () => {
+                            try {
+                              const dataUrl = await fixtureToDataUrl(
+                                workflowId,
+                                fx.name,
+                              );
+                              onChange({
+                                kind: "file",
+                                dataUrl,
+                                filename: fx.name,
+                                mime: dataUrl.match(/^data:([^;]+)/)?.[1] || "",
+                              });
+                            } catch (e: any) {
+                              alert(`Load fixture failed: ${e?.message || e}`);
+                            }
+                          }}
+                        >
+                          {fx.name}
+                        </button>
+                        <button
+                          type="button"
+                          className="del"
+                          title={`Delete fixture ${fx.name}`}
+                          onClick={async () => {
+                            if (
+                              !window.confirm(
+                                `Delete fixture "${fx.name}"? This can't be undone.`,
+                              )
+                            )
+                              return;
+                            try {
+                              await onFixtureDelete(fx.name);
+                            } catch (e: any) {
+                              alert(`Delete failed: ${e?.message || e}`);
+                            }
+                          }}
+                        >
+                          ×
+                        </button>
+                      </span>
+                    );
+                  })}
+                </div>
               </div>
             )}
           </div>
@@ -391,6 +530,7 @@ export function isVideoUrl(s: string): boolean {
 }
 
 export function RunPanel({
+  workflowId,
   workflowSpec,
   inputs,
   blocks,
@@ -453,6 +593,49 @@ export function RunPanel({
   // frame" text stays live and the FPS readout updates smoothly even
   // when no new frames arrive.
   const [, setTick] = useState(0);
+
+  // ---- Fixture library ---------------------------------------------
+  // Per-workflow scene-image library backed by /api/{id}/fixtures.
+  // Lets users save the file they just uploaded and re-pick it next
+  // run instead of finding the file on disk every time. The cap from
+  // the server (5 fixtures × 10 MB) is enforced backend-side; the UI
+  // shows the count so users know where they stand.
+  const [fixtures, setFixtures] = useState<Fixture[]>([]);
+  const [fixturesLimit, setFixturesLimit] = useState<number>(5);
+
+  const refreshFixtures = useCallback(async () => {
+    if (!workflowId) return;
+    try {
+      const r = await listFixtures(workflowId);
+      setFixtures(r.data);
+      setFixturesLimit(r.limits.max_per_workflow || 5);
+    } catch {
+      // 404 on a brand-new workflow before first save is expected;
+      // keep the list empty and let the upload-time error surface
+      // the "save first" hint.
+      setFixtures([]);
+    }
+  }, [workflowId]);
+
+  useEffect(() => {
+    refreshFixtures();
+  }, [refreshFixtures]);
+
+  const onFixtureUpload = useCallback(
+    async (file: File) => {
+      await uploadFixture(workflowId, file);
+      await refreshFixtures();
+    },
+    [workflowId, refreshFixtures],
+  );
+
+  const onFixtureDelete = useCallback(
+    async (name: string) => {
+      await deleteFixture(workflowId, name);
+      await refreshFixtures();
+    },
+    [workflowId, refreshFixtures],
+  );
 
   // Detect devices.
   useEffect(() => {
@@ -983,6 +1166,44 @@ export function RunPanel({
 
   const heroSrc = useMemo(() => pickHeroImage(images)?.src ?? null, [images]);
 
+  // Detections + classifications walked once per payload. The overlay
+  // uses these to draw bboxes/polygons/keypoints on top of every image
+  // tile, so the user can see what the workflow actually detected
+  // without needing a server-side visualization block.
+  const { detections: detectionBlocks, classifications: classificationBlocks } = useMemo(() => {
+    if (!latestPayload) return { detections: [] as DetectionBlock[], classifications: [] as ClassificationBlock[] };
+    return collectPredictions(latestPayload);
+  }, [latestPayload]);
+
+  // Layer toggles persist per session. We keep them on by default —
+  // first-time users want to see everything; power users can suppress
+  // clutter with the chips above the output.
+  const [layers, setLayers] = useState<Layers>(() => {
+    try {
+      const raw = localStorage.getItem("flyt.run.layers");
+      if (raw) return { ...DEFAULT_LAYERS, ...JSON.parse(raw) };
+    } catch {
+      /* ignore */
+    }
+    return DEFAULT_LAYERS;
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("flyt.run.layers", JSON.stringify(layers));
+    } catch {
+      /* ignore */
+    }
+  }, [layers]);
+  const toggleLayer = (k: keyof Layers) =>
+    setLayers((prev) => ({ ...prev, [k]: !prev[k] }));
+
+  // Total detections in the current frame — drives empty states and
+  // the layer toggles' enabled count.
+  const totalDetections = useMemo(
+    () => detectionBlocks.reduce((n, b) => n + b.detections.length, 0),
+    [detectionBlocks],
+  );
+
   // Mirror the live hero image onto the hidden canvas. Doing it here
   // (effect) instead of inline inside the render makes sure the canvas
   // gets a frame even while recording is off — so starting the recorder
@@ -1017,6 +1238,11 @@ export function RunPanel({
             onChange={(s) => setSource(inp.name, s)}
             devices={devices}
             webcamDevices={webcamDevices}
+            workflowId={workflowId}
+            fixtures={fixtures}
+            fixturesLimit={fixturesLimit}
+            onFixtureUpload={onFixtureUpload}
+            onFixtureDelete={onFixtureDelete}
           />
         ))}
       </div>
@@ -1080,6 +1306,46 @@ export function RunPanel({
           JSON
         </button>
       </div>
+      {outputTab === "visual" && (totalDetections > 0 || classificationBlocks.length > 0) && (
+        <div className="layer-toggles" role="group" aria-label="Overlay layers">
+          {totalDetections > 0 && (
+            <span className="count-pill" title={`${totalDetections} detection${totalDetections === 1 ? "" : "s"} this frame`}>
+              {totalDetections} det
+            </span>
+          )}
+          {[
+            { key: "bbox" as const, label: "Boxes" },
+            { key: "mask" as const, label: "Masks" },
+            { key: "keypoints" as const, label: "Keypoints" },
+            { key: "label" as const, label: "Labels" },
+            { key: "conf" as const, label: "Confidence" },
+            { key: "track" as const, label: "Tracker" },
+          ].map((l) => (
+            <button
+              key={l.key}
+              type="button"
+              className={`layer-chip ${layers[l.key] ? "on" : "off"}`}
+              onClick={() => toggleLayer(l.key)}
+              aria-pressed={layers[l.key]}
+              title={`Toggle ${l.label.toLowerCase()} overlay`}
+            >
+              {l.label}
+            </button>
+          ))}
+        </div>
+      )}
+      {outputTab === "visual" && classificationBlocks.length > 0 && (
+        <div className="classification-row">
+          {classificationBlocks.map((c, i) => (
+            <ClassificationBadge
+              key={`${c.path}-${i}`}
+              topClass={c.topClass}
+              topConfidence={c.topConfidence}
+              classes={c.classes}
+            />
+          ))}
+        </div>
+      )}
       <div className="output-body">
         {result.kind === "idle" && (
           <div className="empty">Run to see the output.</div>
@@ -1193,14 +1459,21 @@ export function RunPanel({
                   <div className="spacer" />
                   <span className="stat muted">last {sinceLast}</span>
                 </div>
-                {hero ? (
-                  <img
-                    className="hero-image"
-                    src={hero.src}
-                    alt={hero.path}
-                    onClick={() => setFullscreenSrc(hero.src)}
-                  />
-                ) : (
+                {hero ? (() => {
+                  const block = pairDetectionsToImage(hero.path, detectionBlocks);
+                  return (
+                    <DetectionOverlay
+                      className="hero-image"
+                      imageSrc={hero.src}
+                      imageAlt={hero.path}
+                      imageWidth={block?.imageWidth}
+                      imageHeight={block?.imageHeight}
+                      detections={block?.detections ?? []}
+                      layers={layers}
+                      onClick={() => setFullscreenSrc(hero.src)}
+                    />
+                  );
+                })() : (
                   <div className="empty">
                     Pipeline running — waiting for the first annotated
                     frame…
@@ -1214,16 +1487,23 @@ export function RunPanel({
                 )}
                 {secondaries.length > 0 && (
                   <div className="secondary-tiles">
-                    {secondaries.map((img, i) => (
-                      <div className="tile" key={`${img.path}-${i}`}>
-                        <img
-                          src={img.src}
-                          alt={img.path}
-                          onClick={() => setFullscreenSrc(img.src)}
-                        />
-                        <div className="caption">{img.path}</div>
-                      </div>
-                    ))}
+                    {secondaries.map((img, i) => {
+                      const block = pairDetectionsToImage(img.path, detectionBlocks);
+                      return (
+                        <div className="tile" key={`${img.path}-${i}`}>
+                          <DetectionOverlay
+                            imageSrc={img.src}
+                            imageAlt={img.path}
+                            imageWidth={block?.imageWidth}
+                            imageHeight={block?.imageHeight}
+                            detections={block?.detections ?? []}
+                            layers={layers}
+                            onClick={() => setFullscreenSrc(img.src)}
+                          />
+                          <div className="caption">{img.path}</div>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -1236,16 +1516,23 @@ export function RunPanel({
           result.kind === "image" &&
           images.length > 0 && (
             <div className="output-images">
-              {images.map((img, i) => (
-                <div className="output-image" key={`${img.path}-${i}`}>
-                  <img
-                    src={img.src}
-                    alt={img.path}
-                    onClick={() => setFullscreenSrc(img.src)}
-                  />
-                  <div className="caption">{img.path}</div>
-                </div>
-              ))}
+              {images.map((img, i) => {
+                const block = pairDetectionsToImage(img.path, detectionBlocks);
+                return (
+                  <div className="output-image" key={`${img.path}-${i}`}>
+                    <DetectionOverlay
+                      imageSrc={img.src}
+                      imageAlt={img.path}
+                      imageWidth={block?.imageWidth}
+                      imageHeight={block?.imageHeight}
+                      detections={block?.detections ?? []}
+                      layers={layers}
+                      onClick={() => setFullscreenSrc(img.src)}
+                    />
+                    <div className="caption">{img.path}</div>
+                  </div>
+                );
+              })}
             </div>
           )}
         {outputTab === "visual" &&
