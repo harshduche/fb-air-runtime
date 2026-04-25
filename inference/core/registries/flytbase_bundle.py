@@ -200,13 +200,27 @@ class FlytBaseBundleRegistry(ModelRegistry):
 
     def get_model(self, model_id: str, api_key: str = "", **kwargs) -> Model:
         if model_id.startswith(_BUNDLE_SCHEME):
-            # Local import — keeps yaml + adapter-side imports lazy so the
-            # decorator stays usable in test envs that don't pull yaml.
+            # Local imports keep yaml + cryptography lazy for test envs
+            # that don't need them when the bundle path isn't exercised.
             from inference.core.registries.flytbase_bundle_adapter import (
+                _read_manifest,
                 get_legacy_class_for_bundle,
                 make_redirect_class,
                 stage_bundle_for_engine,
             )
+            from inference.core.registries.flytbase_bundle_gates import (
+                check_license,
+                verify_signature,
+            )
+
+            # Resolve URI once; gates need the manifest before staging
+            # so a refusal short-circuits any disk I/O for synthesis.
+            weights_path = resolve_bundle_uri(model_id)
+            bundle_root = weights_path.parent.parent
+            manifest = _read_manifest(bundle_root)
+
+            check_license(manifest)
+            verify_signature(manifest)
 
             synthetic_endpoint, (task_type, model_type) = stage_bundle_for_engine(
                 model_id
